@@ -201,30 +201,22 @@ impl<P: Provider + 'static, S: StoreWrite + 'static> Ingestor<P, S> {
         let mut seen: HashSet<PostId> = HashSet::new();
         let mut batch = Vec::new();
         let mut total: u64 = 0;
-        let mut cursor: Option<Cursor> = None;
-        let mut page_num = 0usize;
 
-        loop {
-            page_num += 1;
-            info!(page = page_num, root = %root, "fetching replies page");
-
-            let page = self.provider.fetch_replies(root, cursor).await?;
-            let has_next = page.next.is_some();
-
-            for post in page.items {
-                if seen.insert(post.id.clone()) {
-                    batch.push(post);
-                }
-                if batch.len() >= BATCH_SIZE {
-                    let written = self.store.upsert_posts(&batch, Some(run_id))?;
-                    total += written as u64;
-                    batch.clear();
-                }
+        // Use the provider's `fetch_thread` which returns root + all
+        // descendants via the manifest's `post/conversation` edge. Previously
+        // this method only called `fetch_replies`, silently dropping the root
+        // when it wasn't already in the store and storing ZERO posts for a
+        // thread with no replies while still reporting success.
+        info!(root = %root, "fetching conversation");
+        let posts = self.provider.fetch_thread(root).await?;
+        for post in posts {
+            if seen.insert(post.id.clone()) {
+                batch.push(post);
             }
-
-            cursor = page.next;
-            if !has_next {
-                break;
+            if batch.len() >= BATCH_SIZE {
+                let written = self.store.upsert_posts(&batch, Some(run_id))?;
+                total += written as u64;
+                batch.clear();
             }
         }
 

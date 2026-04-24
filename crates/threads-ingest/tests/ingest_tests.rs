@@ -185,11 +185,21 @@ struct MockProvider {
     /// Pages of posts to return from `fetch_my_threads`.
     /// Each inner Vec is one page. The last page has no next cursor.
     pages: Vec<Vec<Post>>,
+    /// Flat list of posts to return from `fetch_thread` (root + descendants).
+    thread_posts: Vec<Post>,
 }
 
 impl MockProvider {
     fn new(pages: Vec<Vec<Post>>) -> Self {
-        Self { pages }
+        Self {
+            pages,
+            thread_posts: vec![],
+        }
+    }
+
+    fn with_thread(mut self, posts: Vec<Post>) -> Self {
+        self.thread_posts = posts;
+        self
     }
 
     fn make_post(id: &str, author: &str) -> Post {
@@ -253,7 +263,7 @@ impl threads_core::Provider for MockProvider {
     }
 
     async fn fetch_thread(&self, _root_id: &PostId) -> Result<Vec<Post>> {
-        Ok(vec![])
+        Ok(self.thread_posts.clone())
     }
 }
 
@@ -401,4 +411,76 @@ async fn orchestrator_single_page_no_cursor() {
 
     let state = store.state.lock().unwrap();
     assert_eq!(state.upserted.len(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// Codex adversarial-review finding #3 regression tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn ingest_thread_persists_root_even_with_no_replies() {
+    // Thread with only the root post (no replies). Pre-fix this stored ZERO
+    // posts while reporting success, silently dropping the requested root.
+    let root_id = PostId::new("root_solo");
+    let root_post = MockProvider::make_post("root_solo", "author");
+    let provider = Arc::new(MockProvider::new(vec![]).with_thread(vec![root_post.clone()]));
+    let store = MockStore::new();
+    let ingestor = Ingestor::new(provider, Box::new(NoopNormalizer), Arc::clone(&store));
+
+    let run = ingestor
+        .ingest_thread(&root_id)
+        .await
+        .expect("ingest_thread failed");
+
+    let state = store.state.lock().unwrap();
+    assert_eq!(state.upserted.len(), 1, "root post must be persisted");
+    assert_eq!(state.upserted[0].id, root_id);
+    assert_eq!(run.posts_fetched, 1);
+    assert!(run.error.is_none());
+}
+
+#[tokio::test]
+async fn ingest_thread_persists_root_and_descendants() {
+    let root_id = PostId::new("root_with_kids");
+    let root = MockProvider::make_post("root_with_kids", "author");
+    let reply_a = MockProvider::make_post("reply_a", "other");
+    let reply_b = MockProvider::make_post("reply_b", "other");
+    let provider = Arc::new(
+        MockProvider::new(vec![])
+            .with_thread(vec![root.clone(), reply_a.clone(), reply_b.clone()]),
+    );
+    let store = MockStore::new();
+    let ingestor = Ingestor::new(provider, Box::new(NoopNormalizer), Arc::clone(&store));
+
+    let run = ingestor
+        .ingest_thread(&root_id)
+        .await
+        .expect("ingest_thread failed");
+
+    let state = store.state.lock().unwrap();
+    assert_eq!(state.upserted.len(), 3, "root + 2 replies should be stored");
+    assert_eq!(run.posts_fetched, 3);
+    let ids: Vec<_> = state.upserted.iter().map(|p| p.id.as_str()).collect();
+    assert!(ids.contains(&"root_with_kids"));
+    assert!(ids.contains(&"reply_a"));
+    assert!(ids.contains(&"reply_b"));
+}
+
+#[tokio::test]
+async fn ingest_thread_empty_result_still_records_run_end() {
+    // fetch_thread returning empty (root not found) should still close out
+    // the FetchRun with 0 posts, not panic or leave a dangling run.
+    let provider = Arc::new(MockProvider::new(vec![]));
+    let store = MockStore::new();
+    let ingestor = Ingestor::new(provider, Box::new(NoopNormalizer), Arc::clone(&store));
+
+    let run = ingestor
+        .ingest_thread(&PostId::new("missing"))
+        .await
+        .expect("ingest_thread failed with empty result");
+    assert_eq!(run.posts_fetched, 0);
+
+    let state = store.state.lock().unwrap();
+    assert_eq!(state.run_started.len(), 1);
+    assert_eq!(state.run_ended.len(), 1);
 }
