@@ -97,6 +97,16 @@ pub enum IngestCommand {
         /// The root post id.
         post_id: String,
     },
+    /// BFS descend fetch_replies from every post you authored, up to
+    /// `--depth` levels deep. Populates replies-to-your-replies (and their
+    /// branching conversation trees) into the local store. Requires a prior
+    /// `ingest me` so the store knows which posts you own.
+    Engagement {
+        /// Max BFS depth below each seed. Real Threads conversations
+        /// rarely exceed 4-5 levels; 8 is a safe default.
+        #[arg(long, default_value_t = 8)]
+        depth: u32,
+    },
 }
 
 #[derive(Debug, clap::Args)]

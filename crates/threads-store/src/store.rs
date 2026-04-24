@@ -86,6 +86,11 @@ impl Store {
         query::get_post(&conn, id)
     }
 
+    pub fn posts_by_author(&self, author: &threads_core::UserId) -> Result<Vec<PostId>> {
+        let conn = self.conn.lock().unwrap();
+        query::posts_by_author(&conn, author)
+    }
+
     pub fn search_text(&self, query_str: &str, limit: usize) -> Result<Vec<Post>> {
         let conn = self.conn.lock().unwrap();
         query::search_text(&conn, query_str, limit)

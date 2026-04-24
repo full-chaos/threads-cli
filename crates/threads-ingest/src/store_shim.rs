@@ -6,7 +6,7 @@
 //! `StoreWrite for threads_store::Store` and wire the two crates together.
 
 use chrono::{DateTime, Utc};
-use threads_core::{FetchRun, Post, PostId, Result};
+use threads_core::{FetchRun, Post, PostId, Result, UserId};
 
 /// Write interface required by the ingestion orchestrator.
 ///
@@ -31,6 +31,10 @@ pub trait StoreWrite: Send + Sync {
 
     /// Look up a single post by id (used for dedup / incremental checks).
     fn get_post(&self, id: &PostId) -> Result<Option<Post>>;
+
+    /// Return the ids of every post authored by `author`. Used by
+    /// `ingest_engagement` to enumerate seeds for the BFS.
+    fn posts_by_author(&self, author: &UserId) -> Result<Vec<PostId>>;
 }
 
 impl StoreWrite for threads_store::Store {
@@ -55,5 +59,9 @@ impl StoreWrite for threads_store::Store {
 
     fn get_post(&self, id: &PostId) -> Result<Option<Post>> {
         Self::get_post(self, id).map_err(Into::into)
+    }
+
+    fn posts_by_author(&self, author: &UserId) -> Result<Vec<PostId>> {
+        Self::posts_by_author(self, author).map_err(Into::into)
     }
 }

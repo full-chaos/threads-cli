@@ -187,6 +187,10 @@ struct MockProvider {
     pages: Vec<Vec<Post>>,
     /// Flat list of posts to return from `fetch_thread` (root + descendants).
     thread_posts: Vec<Post>,
+    /// Per-post-id reply lists for `fetch_replies` (single page, no pagination).
+    replies: std::collections::HashMap<PostId, Vec<Post>>,
+    /// Value returned from `fetch_me`.
+    me: User,
 }
 
 impl MockProvider {
@@ -194,11 +198,29 @@ impl MockProvider {
         Self {
             pages,
             thread_posts: vec![],
+            replies: std::collections::HashMap::new(),
+            me: User {
+                id: UserId::new("mock_user"),
+                username: Some("mock".into()),
+                name: None,
+                biography: None,
+                profile_picture_url: None,
+            },
         }
     }
 
     fn with_thread(mut self, posts: Vec<Post>) -> Self {
         self.thread_posts = posts;
+        self
+    }
+
+    fn with_me(mut self, me: User) -> Self {
+        self.me = me;
+        self
+    }
+
+    fn with_reply_to(mut self, parent: &PostId, replies: Vec<Post>) -> Self {
+        self.replies.insert(parent.clone(), replies);
         self
     }
 
@@ -227,13 +249,7 @@ impl threads_core::Provider for MockProvider {
     }
 
     async fn fetch_me(&self) -> Result<User> {
-        Ok(User {
-            id: UserId::new("mock_user"),
-            username: Some("mock".into()),
-            name: None,
-            biography: None,
-            profile_picture_url: None,
-        })
+        Ok(self.me.clone())
     }
 
     async fn fetch_my_threads(&self, cursor: Option<Cursor>) -> Result<Page<Post>> {
@@ -256,10 +272,13 @@ impl threads_core::Provider for MockProvider {
 
     async fn fetch_replies(
         &self,
-        _post_id: &PostId,
+        post_id: &PostId,
         _cursor: Option<Cursor>,
     ) -> Result<Page<Post>> {
-        Ok(Page::empty())
+        match self.replies.get(post_id) {
+            Some(items) => Ok(Page::new(items.clone(), None)),
+            None => Ok(Page::empty()),
+        }
     }
 
     async fn fetch_thread(&self, _root_id: &PostId) -> Result<Vec<Post>> {
@@ -316,6 +335,15 @@ impl StoreWrite for MockStore {
     fn get_post(&self, id: &PostId) -> Result<Option<Post>> {
         let s = self.state.lock().unwrap();
         Ok(s.upserted.iter().find(|p| &p.id == id).cloned())
+    }
+
+    fn posts_by_author(&self, author: &UserId) -> Result<Vec<PostId>> {
+        let s = self.state.lock().unwrap();
+        Ok(s.upserted
+            .iter()
+            .filter(|p| &p.author == author)
+            .map(|p| p.id.clone())
+            .collect())
     }
 }
 
@@ -483,4 +511,149 @@ async fn ingest_thread_empty_result_still_records_run_end() {
     let state = store.state.lock().unwrap();
     assert_eq!(state.run_started.len(), 1);
     assert_eq!(state.run_ended.len(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// ingest_engagement: BFS "replies to everything I authored"
+// ---------------------------------------------------------------------------
+
+fn post(id: &str, author: &str) -> Post {
+    let mut p = MockProvider::make_post(id, author);
+    p.author = UserId::new(author);
+    p
+}
+
+#[tokio::test]
+async fn engagement_collects_direct_replies_to_my_posts() {
+    // Store seeded with one of MY posts.
+    let me = User {
+        id: UserId::new("me"),
+        username: Some("me".into()),
+        name: None,
+        biography: None,
+        profile_picture_url: None,
+    };
+    let my_post = post("my_post", "me");
+    let reply_a = post("ra", "stranger1");
+    let reply_b = post("rb", "stranger2");
+
+    let provider = Arc::new(
+        MockProvider::new(vec![])
+            .with_me(me.clone())
+            .with_reply_to(&PostId::new("my_post"), vec![reply_a.clone(), reply_b.clone()]),
+    );
+    let store = MockStore::new();
+    // Pre-seed the store: engagement uses posts_by_author to find seeds.
+    store
+        .upsert_posts(std::slice::from_ref(&my_post), None)
+        .unwrap();
+
+    let ingestor = Ingestor::new(provider, Box::new(NoopNormalizer), Arc::clone(&store));
+    let run = ingestor.ingest_engagement(8).await.expect("engagement failed");
+
+    // 2 new replies stored (my_post was already there and is just the seed).
+    assert_eq!(run.posts_fetched, 2);
+    let state = store.state.lock().unwrap();
+    let ids: Vec<_> = state.upserted.iter().map(|p| p.id.as_str()).collect();
+    assert!(ids.contains(&"ra"));
+    assert!(ids.contains(&"rb"));
+}
+
+#[tokio::test]
+async fn engagement_recurses_into_replies_to_replies() {
+    // Shape:
+    //   my_post
+    //   └── ra (stranger)
+    //       └── rb (stranger)
+    //           └── rc (stranger)    <- only collected if BFS keeps going
+    let me_id = UserId::new("me");
+    let me = User { id: me_id.clone(), username: Some("me".into()), name: None, biography: None, profile_picture_url: None };
+    let my_post = post("my_post", "me");
+    let ra = post("ra", "stranger");
+    let rb = post("rb", "stranger");
+    let rc = post("rc", "stranger");
+
+    let provider = Arc::new(
+        MockProvider::new(vec![])
+            .with_me(me)
+            .with_reply_to(&PostId::new("my_post"), vec![ra.clone()])
+            .with_reply_to(&PostId::new("ra"), vec![rb.clone()])
+            .with_reply_to(&PostId::new("rb"), vec![rc.clone()]),
+    );
+    let store = MockStore::new();
+    store.upsert_posts(&[my_post], None).unwrap();
+    let ingestor = Ingestor::new(provider, Box::new(NoopNormalizer), Arc::clone(&store));
+    let run = ingestor.ingest_engagement(8).await.expect("engagement failed");
+
+    assert_eq!(run.posts_fetched, 3, "3 descendants across 3 BFS levels");
+    let state = store.state.lock().unwrap();
+    let ids: Vec<_> = state.upserted.iter().map(|p| p.id.as_str()).collect();
+    for expected in ["ra", "rb", "rc"] {
+        assert!(ids.contains(&expected), "missing {expected}");
+    }
+}
+
+#[tokio::test]
+async fn engagement_respects_depth_cap() {
+    // Same chain as above but cap depth at 1: should stop after ra
+    // (ra is at depth 0 relative to my_post seed; rb would be depth 1; rc
+    // depth 2).
+    let me_id = UserId::new("me");
+    let me = User { id: me_id.clone(), username: Some("me".into()), name: None, biography: None, profile_picture_url: None };
+    let my_post = post("my_post", "me");
+
+    let provider = Arc::new(
+        MockProvider::new(vec![])
+            .with_me(me)
+            .with_reply_to(&PostId::new("my_post"), vec![post("ra", "stranger")])
+            .with_reply_to(&PostId::new("ra"), vec![post("rb", "stranger")])
+            .with_reply_to(&PostId::new("rb"), vec![post("rc", "stranger")]),
+    );
+    let store = MockStore::new();
+    store.upsert_posts(&[my_post], None).unwrap();
+    let ingestor = Ingestor::new(provider, Box::new(NoopNormalizer), Arc::clone(&store));
+    // depth=1: only descend from seed, not from replies.
+    let run = ingestor.ingest_engagement(1).await.expect("engagement failed");
+
+    // Only `ra` collected (direct reply). `rb` and `rc` are past the cap.
+    assert_eq!(run.posts_fetched, 1);
+    let state = store.state.lock().unwrap();
+    let ids: Vec<_> = state.upserted.iter().map(|p| p.id.as_str()).collect();
+    assert!(ids.contains(&"ra"));
+    assert!(!ids.contains(&"rb"));
+    assert!(!ids.contains(&"rc"));
+}
+
+#[tokio::test]
+async fn engagement_deduplicates_across_seeds_and_levels() {
+    // Two seeds that both eventually hit the same reply id — it should
+    // only be fetched/stored once.
+    let me_id = UserId::new("me");
+    let me = User { id: me_id.clone(), username: Some("me".into()), name: None, biography: None, profile_picture_url: None };
+    let seed_a = post("seed_a", "me");
+    let seed_b = post("seed_b", "me");
+    let shared = post("shared", "stranger");
+
+    let provider = Arc::new(
+        MockProvider::new(vec![])
+            .with_me(me)
+            .with_reply_to(&PostId::new("seed_a"), vec![shared.clone()])
+            .with_reply_to(&PostId::new("seed_b"), vec![shared.clone()]),
+    );
+    let store = MockStore::new();
+    store
+        .upsert_posts(&[seed_a, seed_b], None)
+        .unwrap();
+    let ingestor = Ingestor::new(provider, Box::new(NoopNormalizer), Arc::clone(&store));
+    let run = ingestor.ingest_engagement(8).await.expect("engagement failed");
+
+    // `shared` only counts once.
+    assert_eq!(run.posts_fetched, 1);
+    let state = store.state.lock().unwrap();
+    let shared_count = state
+        .upserted
+        .iter()
+        .filter(|p| p.id == PostId::new("shared"))
+        .count();
+    assert_eq!(shared_count, 1);
 }

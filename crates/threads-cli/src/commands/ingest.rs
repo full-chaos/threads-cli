@@ -31,6 +31,13 @@ pub async fn run(
                 .map_err(|e| anyhow!("ingest thread {post_id}: {e}"))?;
             summary(&run);
         }
+        IngestCommand::Engagement { depth } => {
+            let run = ingestor
+                .ingest_engagement(depth)
+                .await
+                .map_err(|e| anyhow!("ingest engagement: {e}"))?;
+            summary(&run);
+        }
     }
     Ok(())
 }

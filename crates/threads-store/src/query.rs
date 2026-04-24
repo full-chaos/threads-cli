@@ -348,6 +348,23 @@ pub fn get_post(conn: &Connection, id: &PostId) -> Result<Option<Post>> {
     load_post(conn, id.as_str())
 }
 
+/// Return every post id where `author_id = ?1`. Used by the ingestion
+/// orchestrator to enumerate "posts I authored" as BFS seeds for
+/// engagement (replies-to-my-stuff) crawls.
+pub fn posts_by_author(conn: &Connection, author: &UserId) -> Result<Vec<PostId>> {
+    let mut stmt = conn
+        .prepare("SELECT id FROM posts WHERE author_id = ?1")
+        .map_err(StoreError::Sqlite)?;
+    let rows: Vec<PostId> = stmt
+        .query_map(params![author.as_str()], |row| {
+            row.get::<_, String>(0).map(PostId::new)
+        })
+        .map_err(StoreError::Sqlite)?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(rows)
+}
+
 /// Return up to `limit` posts ordered by `fetched_at DESC`. Used for
 /// enumeration (export / list) since FTS5 can't match "all posts" cleanly.
 pub fn list_posts(conn: &Connection, limit: usize) -> Result<Vec<Post>> {
