@@ -21,10 +21,13 @@ pub fn run(args: InitArgs, config_override: Option<&Path>) -> Result<()> {
 
     println!("threads-cli init");
     println!("---------------");
-    println!("Register a Threads app at: https://developers.facebook.com/apps/");
-    println!(
-        "Add a Threads product, set OAuth redirect URI, and copy the App ID/Secret here.\n"
-    );
+    println!("1. Create a Meta app at https://developers.facebook.com/apps/");
+    println!("2. Add the 'Threads API' use case to the app.");
+    println!("3. Under Threads API settings -> Redirect Callback URLs, register ONE:");
+    println!("   - Any HTTPS URL you control (e.g. https://example.com/threads-cb),");
+    println!("     or https://localhost/callback (for manual-paste OAuth).");
+    println!("   Meta blocks http:// redirects for the Threads product.");
+    println!("4. Copy the Threads App ID and App Secret from the app dashboard.\n");
 
     let app_id = prompt("Threads App ID: ")?;
     let app_secret = prompt("Threads App Secret: ")?;
@@ -37,6 +40,12 @@ pub fn run(args: InitArgs, config_override: Option<&Path>) -> Result<()> {
     } else {
         redirect
     };
+    if redirect_uri.starts_with("http://") && !redirect_uri.starts_with("http://127.0.0.1") {
+        eprintln!(
+            "warning: Meta blocks non-loopback http:// redirect URIs for the Threads API.\n\
+             Consider using an https:// URL or http://127.0.0.1:PORT/callback."
+        );
+    }
 
     let cfg = CliConfig {
         app_id: Some(app_id),
