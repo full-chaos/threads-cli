@@ -113,6 +113,7 @@ async fn parse_token_response(resp: reqwest::Response) -> Result<TokenResponse> 
 ///
 /// Returns the updated redirect URI (caller uses for authorize_url) together
 /// with a future that resolves to the code on redirect.
+#[derive(Debug)]
 pub struct CallbackServer {
     pub listener: TcpListener,
     pub redirect_uri: String,
@@ -120,7 +121,8 @@ pub struct CallbackServer {
 
 impl CallbackServer {
     /// Bind to `127.0.0.1:0`, using the given `path` for the redirect URI
-    /// (e.g., "/callback").
+    /// (e.g., "/callback"). Only useful for providers that accept
+    /// loopback-with-random-port redirects (most, but NOT Meta Threads).
     pub async fn bind(path: &str) -> Result<Self> {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -136,6 +138,46 @@ impl CallbackServer {
         };
         let redirect_uri = format!("http://127.0.0.1:{port}{p}");
         Ok(Self { listener, redirect_uri })
+    }
+
+    /// Bind to the exact host+port in `configured_uri` so the redirect URI
+    /// stays byte-identical to what the app registered with the provider.
+    ///
+    /// - URI scheme must be `http`. HTTPS on localhost requires TLS cert
+    ///   setup that a CLI can't reasonably do; callers should fall back to
+    ///   manual-paste OAuth for `https://` URIs.
+    /// - Host must be `127.0.0.1` or `localhost`.
+    /// - Port is required (no default). Meta expects an exact match.
+    pub async fn bind_to_uri(configured_uri: &str) -> Result<Self> {
+        let url = Url::parse(configured_uri)
+            .map_err(|e| Error::Config(format!("invalid redirect_uri {configured_uri}: {e}")))?;
+        if url.scheme() != "http" {
+            return Err(Error::Config(format!(
+                "bind_to_uri requires http://; got {}. For https:// URIs, use manual-paste OAuth.",
+                url.scheme()
+            )));
+        }
+        let host = url.host_str().unwrap_or("");
+        if host != "127.0.0.1" && host != "localhost" {
+            return Err(Error::Config(format!(
+                "bind_to_uri only supports loopback; got host {host:?}"
+            )));
+        }
+        let port = url.port().ok_or_else(|| {
+            Error::Config(format!(
+                "redirect_uri {configured_uri} has no port; Meta registration must match exactly"
+            ))
+        })?;
+        // Always bind to 127.0.0.1 even when the URI says "localhost" (avoids
+        // v4/v6 surprises with the OS resolver).
+        let bind_host = "127.0.0.1";
+        let listener = TcpListener::bind(format!("{bind_host}:{port}"))
+            .await
+            .map_err(|e| Error::Network(format!("bind {bind_host}:{port}: {e}")))?;
+        Ok(Self {
+            listener,
+            redirect_uri: configured_uri.to_string(),
+        })
     }
 
     /// Accept a single HTTP request, parse the OAuth code and state.
@@ -295,5 +337,41 @@ mod tests {
         let srv = CallbackServer::bind("/callback").await.unwrap();
         assert!(srv.redirect_uri.starts_with("http://127.0.0.1:"));
         assert!(srv.redirect_uri.ends_with("/callback"));
+    }
+
+    #[tokio::test]
+    async fn bind_to_uri_preserves_exact_port() {
+        // Pick an ephemeral port via OS assignment, then rebind via the
+        // explicit API — confirms that the URI we produce byte-matches input.
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let uri = format!("http://127.0.0.1:{port}/callback");
+        let srv = CallbackServer::bind_to_uri(&uri).await.unwrap();
+        assert_eq!(srv.redirect_uri, uri);
+    }
+
+    #[tokio::test]
+    async fn bind_to_uri_rejects_https() {
+        let err = CallbackServer::bind_to_uri("https://127.0.0.1:8080/cb")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Config(_)));
+    }
+
+    #[tokio::test]
+    async fn bind_to_uri_rejects_non_loopback() {
+        let err = CallbackServer::bind_to_uri("http://example.com:8080/cb")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Config(_)));
+    }
+
+    #[tokio::test]
+    async fn bind_to_uri_requires_port() {
+        let err = CallbackServer::bind_to_uri("http://127.0.0.1/cb")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Config(_)));
     }
 }

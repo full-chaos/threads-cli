@@ -23,29 +23,43 @@ pub fn run(args: InitArgs, config_override: Option<&Path>) -> Result<()> {
     println!("---------------");
     println!("1. Create a Meta app at https://developers.facebook.com/apps/");
     println!("2. Add the 'Threads API' use case to the app.");
-    println!("3. Under Threads API settings -> Redirect Callback URLs, register ONE:");
-    println!("   - Any HTTPS URL you control (e.g. https://example.com/threads-cb),");
-    println!("     or https://localhost/callback (for manual-paste OAuth).");
-    println!("   Meta blocks http:// redirects for the Threads product.");
+    println!("3. Under Threads API -> Redirect Callback URLs, register ONE URI:");
+    println!("   - Recommended: an HTTPS URL you control (e.g. https://example.com/threads-cb)");
+    println!("     -> CLI uses manual-paste OAuth; you'll copy the code from the browser.");
+    println!("   - Meta blocks http:// (error 1349187 'Insecure Login Blocked').");
+    println!("   - The URI you register must match EXACTLY what you enter below.");
     println!("4. Copy the Threads App ID and App Secret from the app dashboard.\n");
 
     let app_id = prompt("Threads App ID: ")?;
     let app_secret = prompt("Threads App Secret: ")?;
-    let default_redirect = "https://localhost/callback";
-    let redirect = prompt(&format!(
-        "Redirect URI [{default_redirect}]: "
-    ))?;
-    let redirect_uri = if redirect.is_empty() {
-        default_redirect.to_string()
-    } else {
-        redirect
+    // No default — Meta requires the registered URI to match byte-for-byte,
+    // so guessing is worse than asking. We do show an example so the shape
+    // is clear.
+    let redirect_uri = loop {
+        let v = prompt(
+            "Redirect URI (exactly as registered in Meta, e.g. \
+             https://example.com/threads-cb): ",
+        )?;
+        if v.is_empty() {
+            eprintln!("redirect_uri cannot be empty — it must match the Meta app dashboard entry");
+            continue;
+        }
+        if v.starts_with("http://") && !v.starts_with("http://127.0.0.1") && !v.starts_with("http://localhost") {
+            eprintln!(
+                "warning: Meta blocks non-loopback http:// redirect URIs for the Threads API.\n\
+                 Consider using an https:// URL."
+            );
+        }
+        if v.starts_with("http://127.0.0.1") || v.starts_with("http://localhost") {
+            if url::Url::parse(&v).ok().and_then(|u| u.port()).is_none() {
+                eprintln!(
+                    "warning: loopback http:// URI has no port. Register with a specific port \
+                     (e.g. http://127.0.0.1:8787/callback) so the local listener can bind it."
+                );
+            }
+        }
+        break v;
     };
-    if redirect_uri.starts_with("http://") && !redirect_uri.starts_with("http://127.0.0.1") {
-        eprintln!(
-            "warning: Meta blocks non-loopback http:// redirect URIs for the Threads API.\n\
-             Consider using an https:// URL or http://127.0.0.1:PORT/callback."
-        );
-    }
 
     let cfg = CliConfig {
         app_id: Some(app_id),

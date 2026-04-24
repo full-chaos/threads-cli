@@ -48,10 +48,31 @@ async fn login_local_listener(
     provider_cfg: &mut threads_provider_official::Config,
     state: &str,
 ) -> Result<()> {
-    let server = CallbackServer::bind("/callback")
-        .await
-        .map_err(|e| anyhow!("bind local callback: {e}"))?;
-    provider_cfg.redirect_uri = server.redirect_uri.clone();
+    // Bind to the EXACT host+port of the configured URI so it byte-matches
+    // what was registered in the app dashboard. Meta rejects any mismatch.
+    // If the URI lacks a port, fall back to OS-assigned — but warn, since
+    // the provider must have whitelisted that generated URI somehow.
+    let has_port = url::Url::parse(&provider_cfg.redirect_uri)
+        .ok()
+        .and_then(|u| u.port())
+        .is_some();
+    let server = if has_port {
+        CallbackServer::bind_to_uri(&provider_cfg.redirect_uri)
+            .await
+            .map_err(|e| anyhow!("bind local callback: {e}"))?
+    } else {
+        eprintln!(
+            "warning: redirect_uri {} has no port; binding to an OS-assigned port.\n\
+             This will only work if the provider treats the loopback URI as \
+             port-agnostic (most do, Meta does not).",
+            provider_cfg.redirect_uri
+        );
+        let s = CallbackServer::bind("/callback")
+            .await
+            .map_err(|e| anyhow!("bind local callback: {e}"))?;
+        provider_cfg.redirect_uri = s.redirect_uri.clone();
+        s
+    };
     info!(uri = %server.redirect_uri, "OAuth callback listener ready");
 
     let url = auth::authorize_url(provider_cfg, DEFAULT_SCOPES, state)
