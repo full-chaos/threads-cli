@@ -50,13 +50,13 @@ pub fn run(args: InitArgs, config_override: Option<&Path>) -> Result<()> {
                  Consider using an https:// URL."
             );
         }
-        if v.starts_with("http://127.0.0.1") || v.starts_with("http://localhost") {
-            if url::Url::parse(&v).ok().and_then(|u| u.port()).is_none() {
-                eprintln!(
-                    "warning: loopback http:// URI has no port. Register with a specific port \
-                     (e.g. http://127.0.0.1:8787/callback) so the local listener can bind it."
-                );
-            }
+        if (v.starts_with("http://127.0.0.1") || v.starts_with("http://localhost"))
+            && url::Url::parse(&v).ok().and_then(|u| u.port()).is_none()
+        {
+            eprintln!(
+                "warning: loopback http:// URI has no port. Register with a specific port \
+                 (e.g. http://127.0.0.1:8787/callback) so the local listener can bind it."
+            );
         }
         break v;
     };
