@@ -83,6 +83,11 @@ impl Store {
         query::search_text(&conn, query_str, limit)
     }
 
+    pub fn list_posts(&self, limit: usize) -> Result<Vec<Post>> {
+        let conn = self.conn.lock().unwrap();
+        query::list_posts(&conn, limit)
+    }
+
     pub fn thread_rooted_at(&self, root_id: &PostId) -> Result<Vec<Post>> {
         let conn = self.conn.lock().unwrap();
         query::thread_rooted_at(&conn, root_id)

@@ -19,6 +19,6 @@ pub use store::Store;
 
 // Re-export query helpers for callers that want to use them directly.
 pub use query::{
-    get_post, record_fetch_run_end, record_fetch_run_start, search_text, thread_rooted_at,
-    upsert_post, upsert_posts, upsert_user,
+    get_post, list_posts, record_fetch_run_end, record_fetch_run_start, search_text,
+    thread_rooted_at, upsert_post, upsert_posts, upsert_user,
 };

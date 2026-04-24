@@ -16,18 +16,42 @@ pub struct CliConfig {
 }
 
 impl CliConfig {
+    /// XDG config root: `$XDG_CONFIG_HOME` if set, else `~/.config`.
+    ///
+    /// We intentionally DON'T use `dirs::config_dir()` because on macOS it
+    /// returns `~/Library/Application Support`, which violates the XDG Base
+    /// Directory spec. A CLI moving between macOS and Linux should put its
+    /// config in the same place on both.
+    fn xdg_config_home() -> PathBuf {
+        std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| {
+                dirs::home_dir()
+                    .unwrap_or_else(|| PathBuf::from("."))
+                    .join(".config")
+            })
+    }
+
+    /// XDG data root: `$XDG_DATA_HOME` if set, else `~/.local/share`.
+    fn xdg_data_home() -> PathBuf {
+        std::env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| {
+                dirs::home_dir()
+                    .unwrap_or_else(|| PathBuf::from("."))
+                    .join(".local")
+                    .join("share")
+            })
+    }
+
     pub fn default_config_path() -> PathBuf {
-        dirs::config_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("threads-cli")
-            .join("config.toml")
+        Self::xdg_config_home().join("threads-cli").join("config.toml")
     }
 
     pub fn default_db_path() -> PathBuf {
-        dirs::data_local_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("threads-cli")
-            .join("store.db")
+        Self::xdg_data_home().join("threads-cli").join("store.db")
     }
 
     fn default_db_path_string() -> String {
@@ -35,10 +59,7 @@ impl CliConfig {
     }
 
     pub fn token_path() -> PathBuf {
-        dirs::config_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("threads-cli")
-            .join("token.json")
+        Self::xdg_config_home().join("threads-cli").join("token.json")
     }
 
     /// Load config, applying env overrides on top of the file contents.

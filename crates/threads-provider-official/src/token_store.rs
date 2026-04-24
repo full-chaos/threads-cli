@@ -46,10 +46,18 @@ pub struct TokenStore {
 
 impl TokenStore {
     pub fn new() -> Self {
-        let fallback_path = dirs::config_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("threads-cli")
-            .join("token.json");
+        // Use XDG config home (same logic as threads-cli's CliConfig) so the
+        // token lives alongside config.toml at ~/.config/threads-cli/ on every
+        // OS, instead of macOS's `~/Library/Application Support`.
+        let config_home = std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| {
+                dirs::home_dir()
+                    .unwrap_or_else(|| PathBuf::from("."))
+                    .join(".config")
+            });
+        let fallback_path = config_home.join("threads-cli").join("token.json");
         Self { fallback_path }
     }
 

@@ -336,6 +336,26 @@ pub fn get_post(conn: &Connection, id: &PostId) -> Result<Option<Post>> {
     load_post(conn, id.as_str())
 }
 
+/// Return up to `limit` posts ordered by `fetched_at DESC`. Used for
+/// enumeration (export / list) since FTS5 can't match "all posts" cleanly.
+pub fn list_posts(conn: &Connection, limit: usize) -> Result<Vec<Post>> {
+    let mut stmt = conn
+        .prepare("SELECT id FROM posts ORDER BY fetched_at DESC LIMIT ?1")
+        .map_err(StoreError::Sqlite)?;
+    let ids: Vec<String> = stmt
+        .query_map(params![limit as i64], |row| row.get(0))
+        .map_err(StoreError::Sqlite)?
+        .filter_map(|r| r.ok())
+        .collect();
+    let mut posts = Vec::with_capacity(ids.len());
+    for id in ids {
+        if let Some(p) = load_post(conn, &id)? {
+            posts.push(p);
+        }
+    }
+    Ok(posts)
+}
+
 // ------------------------------------------------------------------ //
 //  FTS5 search                                                        //
 // ------------------------------------------------------------------ //

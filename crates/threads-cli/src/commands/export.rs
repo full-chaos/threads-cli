@@ -17,13 +17,11 @@ pub fn run(
     let cli_cfg = crate::commands::load_config(config_override)?;
     let store = crate::commands::open_store(&cli_cfg, db_override)?;
 
-    // Export "everything": use an FTS MATCH that matches any post with text,
-    // plus fall back to the full posts list via thread_rooted_at for any
-    // post that is its own root. For v1, a simple search_text with "*" is
-    // adequate — we also query posts one-by-one for zero-text rows via
-    // direct SQL. To keep things lean in v1, just dump what FTS returns.
+    // Enumerate via a plain SELECT rather than FTS5 — FTS5's MATCH needs a
+    // non-trivial query token (`*` alone is invalid), and we want to include
+    // posts with NULL/empty text too.
     let posts = store
-        .search_text("*", usize::MAX)
+        .list_posts(usize::MAX)
         .map_err(|e| anyhow!("enumerate posts: {e}"))?;
 
     let mut writer: Box<dyn Write> = match args.out.as_deref() {

@@ -12,9 +12,17 @@ pub fn run(
 ) -> Result<()> {
     let cli_cfg = crate::commands::load_config(config_override)?;
     let store = crate::commands::open_store(&cli_cfg, db_override)?;
-    let posts = store
-        .search_text(&args.query, args.limit)
-        .map_err(|e| anyhow!("fts5 search: {e}"))?;
+
+    // Convenience: treat "*" (and the empty string) as "list everything".
+    // FTS5 MATCH rejects "*" alone, and asking users to pick a dummy token
+    // is ceremony the store already avoids via list_posts.
+    let posts = if args.query.trim().is_empty() || args.query.trim() == "*" {
+        store.list_posts(args.limit).map_err(|e| anyhow!("list posts: {e}"))?
+    } else {
+        store
+            .search_text(&args.query, args.limit)
+            .map_err(|e| anyhow!("fts5 search: {e}"))?
+    };
     if posts.is_empty() {
         eprintln!("no matches");
         return Ok(());
