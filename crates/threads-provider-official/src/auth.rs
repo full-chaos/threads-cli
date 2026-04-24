@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use threads_core::{Error, Result};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -40,8 +40,30 @@ pub struct TokenResponse {
     pub token_type: Option<String>,
     #[serde(default)]
     pub expires_in: Option<i64>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_id_flex")]
     pub user_id: Option<String>,
+}
+
+/// Meta returns numeric IDs as a JSON integer in the OAuth token response but
+/// as a JSON string in most Graph API responses. Accept either and normalize
+/// to `String` so downstream code has one type.
+fn deserialize_id_flex<'de, D>(de: D) -> std::result::Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum IdFormat {
+        Str(String),
+        I(i64),
+        U(u64),
+    }
+    let opt = Option::<IdFormat>::deserialize(de)?;
+    Ok(opt.map(|v| match v {
+        IdFormat::Str(s) => s,
+        IdFormat::I(n) => n.to_string(),
+        IdFormat::U(n) => n.to_string(),
+    }))
 }
 
 /// Exchange an authorization code for a short-lived access token.
@@ -365,6 +387,30 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, Error::Config(_)));
+    }
+
+    #[test]
+    fn token_response_accepts_integer_user_id() {
+        // Real-world: Meta's /oauth/access_token endpoint returns user_id as a
+        // JSON integer larger than i32::MAX.
+        let body = r#"{"access_token":"abc","user_id":26490227934002266}"#;
+        let tr: TokenResponse = serde_json::from_str(body).unwrap();
+        assert_eq!(tr.access_token, "abc");
+        assert_eq!(tr.user_id.as_deref(), Some("26490227934002266"));
+    }
+
+    #[test]
+    fn token_response_accepts_string_user_id() {
+        let body = r#"{"access_token":"abc","user_id":"26490227934002266"}"#;
+        let tr: TokenResponse = serde_json::from_str(body).unwrap();
+        assert_eq!(tr.user_id.as_deref(), Some("26490227934002266"));
+    }
+
+    #[test]
+    fn token_response_without_user_id() {
+        let body = r#"{"access_token":"abc"}"#;
+        let tr: TokenResponse = serde_json::from_str(body).unwrap();
+        assert!(tr.user_id.is_none());
     }
 
     #[tokio::test]
