@@ -1,24 +1,17 @@
 //! # threads-ingest
 //!
 //! Orchestrates the pipeline:
-//! `provider -> Normalizer -> Store` with pagination, dedup, provenance
-//! tagging (fetch_run_id), and raw JSON retention. Per the PRD, normalization
-//! is a one-way mapping into the stable internal model.
+//! `provider → Normalizer → StoreWrite` with pagination, dedup,
+//! provenance tagging (`fetch_run_id`), and raw JSON retention.
 //!
-//! TODO(phase-1-team-D):
-//! - Normalizer trait with an `OfficialNormalizer` impl
-//! - Orchestrator: pagination loop, dedup by PostId, provenance tagging
-//! - Fixture-based unit tests
+//! Per the PRD: normalization is a one-way mapping into the stable internal
+//! model defined in `threads-core`.
 
-pub use threads_core::{Edge, FetchRun, Post, User};
+pub mod normalizer;
+pub mod orchestrator;
+pub mod store_shim;
 
-/// Placeholder. The real implementation lands in Phase 1 Team D.
-pub struct Ingestor {
-    _private: (),
-}
-
-impl Ingestor {
-    pub fn placeholder() -> Self {
-        Self { _private: () }
-    }
-}
+// Convenience re-exports for downstream crates.
+pub use normalizer::{NormalizeError, Normalizer, OfficialNormalizer};
+pub use orchestrator::Ingestor;
+pub use store_shim::StoreWrite;

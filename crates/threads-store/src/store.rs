@@ -54,6 +54,14 @@ impl Store {
         })
     }
 
+    /// Test-only locked-connection access so the sibling `tests` module and
+    /// test-only probes in `query` can issue raw SQL. Not exported outside
+    /// `cfg(test)`.
+    #[cfg(test)]
+    pub(crate) fn raw_conn(&self) -> std::sync::MutexGuard<'_, Connection> {
+        self.conn.lock().unwrap()
+    }
+
     // ------------------------------------------------------------------ //
     //  Query wrappers (delegate to query module)                          //
     // ------------------------------------------------------------------ //
@@ -78,9 +86,19 @@ impl Store {
         query::get_post(&conn, id)
     }
 
+    pub fn posts_by_author(&self, author: &threads_core::UserId) -> Result<Vec<PostId>> {
+        let conn = self.conn.lock().unwrap();
+        query::posts_by_author(&conn, author)
+    }
+
     pub fn search_text(&self, query_str: &str, limit: usize) -> Result<Vec<Post>> {
         let conn = self.conn.lock().unwrap();
         query::search_text(&conn, query_str, limit)
+    }
+
+    pub fn list_posts(&self, limit: usize) -> Result<Vec<Post>> {
+        let conn = self.conn.lock().unwrap();
+        query::list_posts(&conn, limit)
     }
 
     pub fn thread_rooted_at(&self, root_id: &PostId) -> Result<Vec<Post>> {

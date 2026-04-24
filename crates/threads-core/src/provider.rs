@@ -21,6 +21,15 @@ pub trait Provider: Send + Sync {
     /// One page of the authenticated user's top-level threads.
     async fn fetch_my_threads(&self, cursor: Option<Cursor>) -> Result<Page<Post>>;
 
+    /// One page of the authenticated user's replies (replies made BY the
+    /// authenticated user TO other posts).
+    ///
+    /// Defaults to an empty page so older implementations can opt in
+    /// incrementally without breaking the trait's object-safety.
+    async fn fetch_my_replies(&self, _cursor: Option<Cursor>) -> Result<Page<Post>> {
+        Ok(Page::empty())
+    }
+
     /// One page of replies to a given post.
     async fn fetch_replies(
         &self,
