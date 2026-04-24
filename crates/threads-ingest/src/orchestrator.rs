@@ -139,16 +139,15 @@ impl<P: Provider + 'static, S: StoreWrite + 'static> Ingestor<P, S> {
         let mut seen: HashSet<PostId> = HashSet::new();
         let mut batch = Vec::new();
         let mut total: u64 = 0;
+
+        // Phase 1 — own top-level threads.
         let mut cursor: Option<Cursor> = None;
         let mut page_num = 0usize;
-
         loop {
             page_num += 1;
-            info!(page = page_num, "fetching my-threads page");
-
+            info!(page = page_num, edge = "me/threads", "fetching page");
             let page = self.provider.fetch_my_threads(cursor).await?;
             let has_next = page.next.is_some();
-
             for post in page.items {
                 if seen.insert(post.id.clone()) {
                     batch.push(post);
@@ -159,7 +158,30 @@ impl<P: Provider + 'static, S: StoreWrite + 'static> Ingestor<P, S> {
                     batch.clear();
                 }
             }
+            cursor = page.next;
+            if !has_next {
+                break;
+            }
+        }
 
+        // Phase 2 — own replies (replies I made to other posts).
+        let mut cursor: Option<Cursor> = None;
+        let mut page_num = 0usize;
+        loop {
+            page_num += 1;
+            info!(page = page_num, edge = "me/replies", "fetching page");
+            let page = self.provider.fetch_my_replies(cursor).await?;
+            let has_next = page.next.is_some();
+            for post in page.items {
+                if seen.insert(post.id.clone()) {
+                    batch.push(post);
+                }
+                if batch.len() >= BATCH_SIZE {
+                    let written = self.store.upsert_posts(&batch, Some(run_id))?;
+                    total += written as u64;
+                    batch.clear();
+                }
+            }
             cursor = page.next;
             if !has_next {
                 break;

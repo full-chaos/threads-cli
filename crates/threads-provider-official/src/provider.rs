@@ -105,6 +105,24 @@ impl Provider for OfficialProvider {
         Ok(envelope_to_page(env, None))
     }
 
+    async fn fetch_my_replies(&self, cursor: Option<Cursor>) -> Result<Page<Post>> {
+        let path = self
+            .edge_path("me/replies")
+            .ok_or_else(|| Error::Manifest("missing edge `me/replies`".into()))?;
+        let fields = self.endpoint_fields("me/replies");
+        let mut q: Vec<(&str, &str)> = Vec::new();
+        if let Some(ref f) = fields {
+            q.push(("fields", f.as_str()));
+        }
+        let cur: String;
+        if let Some(c) = cursor {
+            cur = c.0;
+            q.push(("after", cur.as_str()));
+        }
+        let env: Envelope<PostDto> = self.http.get_json(&path, &q).await?;
+        Ok(envelope_to_page(env, None))
+    }
+
     async fn fetch_replies(
         &self,
         post_id: &PostId,
@@ -250,9 +268,16 @@ fn collect_children_media(dto: &PostDto) -> Vec<Media> {
 }
 
 fn parse_timestamp(s: &str) -> Option<DateTime<Utc>> {
-    DateTime::parse_from_rfc3339(s)
-        .ok()
-        .map(|dt| dt.with_timezone(&Utc))
+    // Meta's Threads API returns timestamps as `2026-04-24T18:15:44+0000` —
+    // valid ISO 8601 but NOT RFC 3339 (which mandates a colon in the TZ
+    // offset). Try RFC 3339 first, then fall back to the colonless form.
+    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+        return Some(dt.with_timezone(&Utc));
+    }
+    if let Ok(dt) = DateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%z") {
+        return Some(dt.with_timezone(&Utc));
+    }
+    None
 }
 
 #[cfg(test)]
@@ -305,6 +330,26 @@ mod tests {
         let post = dto_to_post(dto, Some(&PostId::new("root-x")));
         assert_eq!(post.parent_id, Some(PostId::new("parent")));
         assert_eq!(post.root_id, Some(PostId::new("root-x")));
+    }
+
+    #[test]
+    fn parse_timestamp_accepts_meta_format() {
+        // Meta returns `+0000` (no colon), which is valid ISO 8601 but not
+        // RFC 3339. chrono's strict RFC 3339 parser rejects it.
+        let ts = parse_timestamp("2026-04-24T18:15:44+0000").unwrap();
+        assert_eq!(ts.to_rfc3339(), "2026-04-24T18:15:44+00:00");
+    }
+
+    #[test]
+    fn parse_timestamp_accepts_rfc3339() {
+        let ts = parse_timestamp("2026-04-24T18:15:44+00:00").unwrap();
+        assert_eq!(ts.to_rfc3339(), "2026-04-24T18:15:44+00:00");
+    }
+
+    #[test]
+    fn parse_timestamp_rejects_garbage() {
+        assert!(parse_timestamp("not a date").is_none());
+        assert!(parse_timestamp("").is_none());
     }
 
     #[test]
