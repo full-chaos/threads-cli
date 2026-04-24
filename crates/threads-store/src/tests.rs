@@ -422,4 +422,76 @@ mod tests {
         assert_eq!(fetched.urls.len(), 1);
         assert_eq!(fetched.urls[0].url, "https://threads.net");
     }
+
+    // ------------------------------------------------------------------ //
+    //  Regression: stale edges on re-upsert (Codex finding #1)            //
+    // ------------------------------------------------------------------ //
+
+    fn count_edges_from(store: &Store, from: &str) -> i64 {
+        crate::query::test_only_count_edges_from(store, from)
+    }
+
+    #[test]
+    fn reupsert_without_parent_drops_stale_edges() {
+        let store = Store::open_in_memory().unwrap();
+
+        // First upsert: reply to parent B, rooted at R, mentions M1.
+        store.upsert_user(&make_user("B")).unwrap();
+        store.upsert_user(&make_user("R")).unwrap();
+        store.upsert_user(&make_user("M1")).unwrap();
+        let mut p = make_post("A", "author");
+        p.parent_id = Some(PostId::new("B"));
+        p.root_id = Some(PostId::new("R"));
+        p.mentions = vec![Mention {
+            username: "m1".into(),
+            user_id: Some(UserId::new("M1")),
+        }];
+        store.upsert_post(&p, None).unwrap();
+        assert_eq!(
+            count_edges_from(&store, "A"),
+            3,
+            "expect reply+root+mention edges after first upsert"
+        );
+
+        // Second upsert: top-level, no mentions. Old edges must be gone.
+        let mut p2 = make_post("A", "author");
+        p2.parent_id = None;
+        p2.root_id = None;
+        p2.mentions = vec![];
+        store.upsert_post(&p2, None).unwrap();
+        assert_eq!(
+            count_edges_from(&store, "A"),
+            0,
+            "stale reply/root/mention edges were left behind (see Codex finding #1)"
+        );
+    }
+
+    #[test]
+    fn reupsert_replaces_mention_edges() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_user(&make_user("M1")).unwrap();
+        store.upsert_user(&make_user("M2")).unwrap();
+
+        let mut p = make_post("A", "author");
+        p.mentions = vec![Mention {
+            username: "m1".into(),
+            user_id: Some(UserId::new("M1")),
+        }];
+        store.upsert_post(&p, None).unwrap();
+        assert_eq!(count_edges_from(&store, "A"), 1);
+
+        // Swap the mention. Previous edge should vanish, new one should appear.
+        let mut p2 = make_post("A", "author");
+        p2.mentions = vec![Mention {
+            username: "m2".into(),
+            user_id: Some(UserId::new("M2")),
+        }];
+        store.upsert_post(&p2, None).unwrap();
+        assert_eq!(count_edges_from(&store, "A"), 1);
+        // And it's specifically the M2 edge, not M1.
+        assert_eq!(
+            crate::query::test_only_edge_target(&store, "A", "mention"),
+            Some("M2".to_string())
+        );
+    }
 }

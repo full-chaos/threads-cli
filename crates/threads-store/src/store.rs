@@ -54,6 +54,14 @@ impl Store {
         })
     }
 
+    /// Test-only locked-connection access so the sibling `tests` module and
+    /// test-only probes in `query` can issue raw SQL. Not exported outside
+    /// `cfg(test)`.
+    #[cfg(test)]
+    pub(crate) fn raw_conn(&self) -> std::sync::MutexGuard<'_, Connection> {
+        self.conn.lock().unwrap()
+    }
+
     // ------------------------------------------------------------------ //
     //  Query wrappers (delegate to query module)                          //
     // ------------------------------------------------------------------ //

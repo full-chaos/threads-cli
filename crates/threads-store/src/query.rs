@@ -123,6 +123,18 @@ fn upsert_post_tx(tx: &Transaction, post: &Post, fetch_run_id: Option<&str>) -> 
         .map_err(StoreError::Sqlite)?;
     tx.execute("DELETE FROM mentions WHERE post_id = ?1", params![post.id.as_str()])
         .map_err(StoreError::Sqlite)?;
+    // Also drop existing edges OWNED by this post (`from_id = post.id`) for
+    // the kinds we manage here. Without this, reingesting a post whose
+    // parent_id / root_id / mentions changed would LEAVE behind stale
+    // rows — recursive thread traversal would keep returning posts in
+    // threads they no longer belong to. `INSERT OR IGNORE` below only
+    // dedups, it doesn't reconcile.
+    tx.execute(
+        "DELETE FROM edges
+         WHERE from_id = ?1 AND kind IN ('reply','root','mention','quote')",
+        params![post.id.as_str()],
+    )
+    .map_err(StoreError::Sqlite)?;
 
     // Media.
     for m in &post.media {
@@ -488,4 +500,34 @@ fn _edge_kind_from_str(s: &str) -> Option<EdgeKind> {
         "quote" => Some(EdgeKind::Quote),
         _ => None,
     }
+}
+
+// ------------------------------------------------------------------ //
+//  Test-only probes                                                   //
+// ------------------------------------------------------------------ //
+
+#[cfg(test)]
+pub(crate) fn test_only_count_edges_from(store: &crate::Store, from: &str) -> i64 {
+    let conn = store.raw_conn();
+    conn.query_row(
+        "SELECT COUNT(*) FROM edges WHERE from_id = ?1 AND kind IN ('reply','root','mention','quote')",
+        params![from],
+        |r| r.get::<_, i64>(0),
+    )
+    .unwrap_or(0)
+}
+
+#[cfg(test)]
+pub(crate) fn test_only_edge_target(
+    store: &crate::Store,
+    from: &str,
+    kind: &str,
+) -> Option<String> {
+    let conn = store.raw_conn();
+    conn.query_row(
+        "SELECT to_id FROM edges WHERE from_id = ?1 AND kind = ?2",
+        params![from, kind],
+        |r| r.get::<_, String>(0),
+    )
+    .ok()
 }
