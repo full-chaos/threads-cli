@@ -30,9 +30,9 @@
       "Bash(sqlite3*)",
       "Bash(rm -rf target)",
       "Bash(touch*)",
-      "Read(/Users/chris/projects/full-chaos/threads-cli/**)",
-      "Write(/Users/chris/projects/full-chaos/threads-cli/**)",
-      "Edit(/Users/chris/projects/full-chaos/threads-cli/**)"
+      "Read(/Users/chris/projects/full-chaos/**)",
+      "Write(/Users/chris/projects/full-chaos/**)",
+      "Edit(/Users/chris/projects/full-chaos/**)"
     ]
   }
 }

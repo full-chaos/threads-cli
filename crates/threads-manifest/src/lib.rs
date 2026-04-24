@@ -73,6 +73,7 @@ fn default_get() -> String {
 }
 
 impl Manifest {
+    #[allow(clippy::should_implement_trait)] // Result type differs from FromStr's
     pub fn from_str(s: &str) -> Result<Self> {
         let m: Manifest = toml::from_str(s)?;
         m.validate()?;
