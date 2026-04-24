@@ -1,0 +1,130 @@
+# Threads Graph API — official endpoint manifest.
+#
+# This file is the versioned local contract for the public
+# https://graph.threads.net API. It is intentionally NOT derived from runtime
+# introspection (the API is REST-like, not GraphQL). When Meta changes the API,
+# bump this manifest version and record the diff in git.
+#
+# PRD reference: threads_api_cli_prd_correction.md
+
+[api]
+base_url = "https://graph.threads.net"
+version = "v1.0"
+
+# ------------------------------------------------------------------
+# Objects (single-resource GETs)
+# ------------------------------------------------------------------
+
+[[objects]]
+name = "me"
+path = "/v1.0/me"
+method = "GET"
+permission = "threads_basic"
+fields = [
+    "id",
+    "username",
+    "name",
+    "threads_profile_picture_url",
+    "threads_biography",
+]
+
+[[objects]]
+name = "post"
+path = "/v1.0/{post-id}"
+method = "GET"
+permission = "threads_basic"
+fields = [
+    "id",
+    "media_product_type",
+    "media_type",
+    "media_url",
+    "permalink",
+    "owner",
+    "username",
+    "text",
+    "timestamp",
+    "shortcode",
+    "thumbnail_url",
+    "children",
+    "is_quote_post",
+]
+
+# ------------------------------------------------------------------
+# Edges (paginated collections)
+# ------------------------------------------------------------------
+
+[[edges]]
+name = "me/threads"
+path = "/v1.0/me/threads"
+method = "GET"
+permission = "threads_basic"
+paginated = true
+fields = [
+    "id",
+    "media_product_type",
+    "media_type",
+    "media_url",
+    "permalink",
+    "owner",
+    "username",
+    "text",
+    "timestamp",
+    "shortcode",
+    "thumbnail_url",
+    "children",
+    "is_quote_post",
+]
+
+[[edges]]
+name = "me/replies"
+path = "/v1.0/me/replies"
+method = "GET"
+permission = "threads_read_replies"
+paginated = true
+fields = [
+    "id",
+    "text",
+    "timestamp",
+    "permalink",
+    "username",
+    "root_post",
+    "replied_to",
+    "is_reply",
+    "hide_status",
+]
+
+[[edges]]
+name = "post/replies"
+path = "/v1.0/{post-id}/replies"
+method = "GET"
+permission = "threads_read_replies"
+paginated = true
+fields = [
+    "id",
+    "text",
+    "timestamp",
+    "permalink",
+    "username",
+    "root_post",
+    "replied_to",
+    "is_reply",
+    "hide_status",
+]
+
+[[edges]]
+name = "post/conversation"
+path = "/v1.0/{post-id}/conversation"
+method = "GET"
+permission = "threads_read_replies"
+paginated = true
+fields = [
+    "id",
+    "text",
+    "timestamp",
+    "permalink",
+    "username",
+    "root_post",
+    "replied_to",
+    "is_reply",
+    "hide_status",
+]

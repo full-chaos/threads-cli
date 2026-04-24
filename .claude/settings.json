@@ -1,0 +1,38 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo build*)",
+      "Bash(cargo test*)",
+      "Bash(cargo clippy*)",
+      "Bash(cargo check*)",
+      "Bash(cargo add*)",
+      "Bash(cargo fmt*)",
+      "Bash(cargo new*)",
+      "Bash(cargo run*)",
+      "Bash(cargo metadata*)",
+      "Bash(cargo tree*)",
+      "Bash(git init*)",
+      "Bash(git add*)",
+      "Bash(git commit*)",
+      "Bash(git checkout*)",
+      "Bash(git branch*)",
+      "Bash(git status*)",
+      "Bash(git log*)",
+      "Bash(git diff*)",
+      "Bash(git worktree*)",
+      "Bash(git rev-parse*)",
+      "Bash(git switch*)",
+      "Bash(git merge*)",
+      "Bash(mkdir*)",
+      "Bash(ls*)",
+      "Bash(cat*)",
+      "Bash(rustup*)",
+      "Bash(sqlite3*)",
+      "Bash(rm -rf target)",
+      "Bash(touch*)",
+      "Read(/Users/chris/projects/full-chaos/threads-cli/**)",
+      "Write(/Users/chris/projects/full-chaos/threads-cli/**)",
+      "Edit(/Users/chris/projects/full-chaos/threads-cli/**)"
+    ]
+  }
+}

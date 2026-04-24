@@ -1,0 +1,67 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/threads-core",
+    "crates/threads-manifest",
+    "crates/threads-provider-official",
+    "crates/threads-provider-web",
+    "crates/threads-store",
+    "crates/threads-ingest",
+    "crates/threads-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+authors = ["threads-cli contributors"]
+repository = "https://github.com/chrisgeorge/threads-cli"
+
+[workspace.dependencies]
+# async runtime
+tokio = { version = "1.40", features = ["rt-multi-thread", "macros", "net", "io-util", "signal", "time", "fs"] }
+async-trait = "0.1"
+
+# http
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+url = { version = "2.5", features = ["serde"] }
+
+# serde + formats
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+csv = "1.3"
+
+# cli
+clap = { version = "4.5", features = ["derive", "env", "wrap_help"] }
+
+# storage
+rusqlite = { version = "0.33", features = ["bundled", "chrono", "serde_json"] }
+
+# errors + logging
+thiserror = "2.0"
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# utilities
+chrono = { version = "0.4", features = ["serde"] }
+keyring = { version = "3", default-features = false, features = ["apple-native", "sync-secret-service"] }
+dirs = "5"
+
+# test helpers
+tempfile = "3"
+
+# internal crates (self-refs)
+threads-core = { path = "crates/threads-core", version = "0.1.0" }
+threads-manifest = { path = "crates/threads-manifest", version = "0.1.0" }
+threads-provider-official = { path = "crates/threads-provider-official", version = "0.1.0" }
+threads-provider-web = { path = "crates/threads-provider-web", version = "0.1.0" }
+threads-store = { path = "crates/threads-store", version = "0.1.0" }
+threads-ingest = { path = "crates/threads-ingest", version = "0.1.0" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
