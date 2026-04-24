@@ -1,0 +1,32 @@
+{
+  "data": [
+    {
+      "id": "reply_001",
+      "owner": { "id": "9876543210" },
+      "text": "Great post! Love this.",
+      "timestamp": "2024-01-15T11:00:00+0000",
+      "permalink": "https://www.threads.net/@otheruser/post/reply_001",
+      "media_type": "TEXT_POST",
+      "is_quote_post": false,
+      "replied_to": { "id": "post_001" },
+      "root_post": { "id": "post_001" }
+    },
+    {
+      "id": "reply_002",
+      "owner": { "id": "1111111111" },
+      "text": "Totally agree, keep it up!",
+      "timestamp": "2024-01-15T12:30:00+0000",
+      "permalink": "https://www.threads.net/@anotheruser/post/reply_002",
+      "media_type": "TEXT_POST",
+      "is_quote_post": false,
+      "replied_to": { "id": "post_001" },
+      "root_post": { "id": "post_001" }
+    }
+  ],
+  "paging": {
+    "cursors": {
+      "before": "reply_cursor_before",
+      "after": null
+    }
+  }
+}
