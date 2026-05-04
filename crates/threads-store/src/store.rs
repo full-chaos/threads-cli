@@ -3,7 +3,7 @@ use std::sync::Mutex;
 
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OpenFlags};
-use threads_core::model::{FetchRun, Post, PostId, User};
+use threads_core::model::{FetchRun, Post, PostId, User, UserId};
 
 use crate::error::{Result, StoreError};
 use crate::migrations::run_migrations;
@@ -99,6 +99,44 @@ impl Store {
     pub fn list_posts(&self, limit: usize) -> Result<Vec<Post>> {
         let conn = self.conn.lock().unwrap();
         query::list_posts(&conn, limit)
+    }
+
+    pub fn posts_in_window(
+        &self,
+        author: &UserId,
+        after: Option<DateTime<Utc>>,
+        before: Option<DateTime<Utc>>,
+        kind: query::PostKind,
+        limit: usize,
+    ) -> Result<Vec<Post>> {
+        let conn = self.conn.lock().unwrap();
+        query::posts_in_window(&conn, author, after, before, kind, limit)
+    }
+
+    pub fn delete_post(&self, id: &PostId) -> Result<bool> {
+        let mut conn = self.conn.lock().unwrap();
+        query::delete_post(&mut conn, id)
+    }
+
+    pub fn record_deletion(
+        &self,
+        id: &PostId,
+        kind: query::PostKind,
+        success: bool,
+        error: Option<&str>,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        query::record_deletion(&conn, id, kind, success, error)
+    }
+
+    pub fn deletions_in_last_24h(&self) -> Result<u64> {
+        let conn = self.conn.lock().unwrap();
+        query::deletions_in_last_24h(&conn)
+    }
+
+    pub fn oldest_deletion_in_last_24h(&self) -> Result<Option<DateTime<Utc>>> {
+        let conn = self.conn.lock().unwrap();
+        query::oldest_deletion_in_last_24h(&conn)
     }
 
     pub fn thread_rooted_at(&self, root_id: &PostId) -> Result<Vec<Post>> {
