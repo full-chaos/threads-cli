@@ -118,6 +118,92 @@ impl HttpClient {
             }
         }
     }
+
+    /// DELETE `path` (absolute or relative to `base`) returning the raw JSON `Value`.
+    ///
+    /// Equivalent curl shape:
+    /// `curl -X DELETE 'https://graph.threads.net/v1.0/{post-id}?access_token=...'`.
+    pub async fn delete_json(
+        &self,
+        path: &str,
+        query: &[(&str, &str)],
+    ) -> Result<serde_json::Value> {
+        let mut url = if path.starts_with("http://") || path.starts_with("https://") {
+            Url::parse(path)?
+        } else {
+            self.base.join(path)?
+        };
+        {
+            let mut q = url.query_pairs_mut();
+            for (k, v) in query {
+                q.append_pair(k, v);
+            }
+            q.append_pair("access_token", &self.token);
+        }
+
+        let mut attempt = 0u32;
+        let mut delay_ms = 250u64;
+        loop {
+            attempt += 1;
+            let resp = self
+                .inner
+                .delete(url.clone())
+                .send()
+                .await
+                .map_err(|e| Error::Network(e.to_string()))?;
+            let status = resp.status();
+            let app_usage = resp
+                .headers()
+                .get("x-app-usage")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned);
+            let retry_after = resp
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok());
+
+            if status.is_success() {
+                let body = resp.text().await.map_err(|e| Error::Network(e.to_string()))?;
+                if let Some(usage) = app_usage.as_deref() {
+                    if is_near_limit(usage) {
+                        warn!(usage, "threads API near rate limit; client-side backoff");
+                    }
+                }
+                if body.trim().is_empty() {
+                    return Ok(serde_json::Value::Null);
+                }
+                return serde_json::from_str(&body).map_err(Error::from);
+            }
+
+            let body = resp.text().await.unwrap_or_default();
+            match status.as_u16() {
+                401 | 403 => return Err(Error::Auth(format!("{status}: {body}"))),
+                404 => return Err(Error::NotFound(body)),
+                429 => {
+                    if attempt > 5 {
+                        return Err(Error::RateLimit {
+                            retry_after: retry_after.map(Duration::from_secs),
+                        });
+                    }
+                    let wait = retry_after
+                        .map(Duration::from_secs)
+                        .unwrap_or_else(|| backoff(delay_ms));
+                    debug!(?wait, attempt, "rate limited, backing off");
+                    tokio::time::sleep(wait).await;
+                    delay_ms = (delay_ms * 2).min(30_000);
+                }
+                s if (500..600).contains(&s) => {
+                    if attempt > 5 {
+                        return Err(Error::Network(format!("{status}: {body}")));
+                    }
+                    tokio::time::sleep(backoff(delay_ms)).await;
+                    delay_ms = (delay_ms * 2).min(30_000);
+                }
+                _ => return Err(Error::Other(format!("{status}: {body}"))),
+            }
+        }
+    }
 }
 
 fn is_near_limit(x_app_usage: &str) -> bool {
