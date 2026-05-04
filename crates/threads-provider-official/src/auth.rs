@@ -15,10 +15,11 @@ const TOKEN_EXCHANGE_BASE: &str = "https://graph.threads.net/oauth/access_token"
 const ACCESS_TOKEN_BASE: &str = "https://graph.threads.net/access_token";
 const REFRESH_BASE: &str = "https://graph.threads.net/refresh_access_token";
 
-/// Default OAuth scopes covering read-only v1 MVP behavior.
+/// Default OAuth scopes covering v1 MVP behavior.
 pub const DEFAULT_SCOPES: &[&str] = &[
     "threads_basic",
     "threads_read_replies",
+    "threads_delete",
 ];
 
 /// Build the URL the user must visit to grant authorization.
@@ -330,6 +331,11 @@ mod tests {
         assert_eq!(q["redirect_uri"], "https://localhost/cb");
         assert_eq!(q["scope"], "threads_basic,threads_read_replies");
         assert_eq!(q["state"], "xyz");
+    }
+
+    #[test]
+    fn default_scopes_include_delete_permission() {
+        assert!(DEFAULT_SCOPES.contains(&"threads_delete"));
     }
 
     #[test]

@@ -4,7 +4,7 @@ use std::{
     path::Path,
 };
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use threads_provider_official::{
     auth::{self, CallbackServer, DEFAULT_SCOPES},
     token_store::{Token, TokenStore},
@@ -81,7 +81,9 @@ async fn login_local_listener(
     println!("Opening browser to authorize threads-cli...");
     println!("If it does not open, visit this URL manually:");
     println!("  {url}");
-    let _ = std::process::Command::new("open").arg(url.as_str()).status();
+    let _ = std::process::Command::new("open")
+        .arg(url.as_str())
+        .status();
 
     let code = server
         .accept_code(state)
@@ -109,7 +111,9 @@ async fn login_manual_paste(
          address bar and paste it here. (State to match: {state})\n"
     );
 
-    let _ = std::process::Command::new("open").arg(url.as_str()).status();
+    let _ = std::process::Command::new("open")
+        .arg(url.as_str())
+        .status();
 
     print!("Paste URL or code: ");
     io::stdout().flush()?;
@@ -126,10 +130,7 @@ async fn login_manual_paste(
     finish_login(provider_cfg, &code).await
 }
 
-async fn finish_login(
-    provider_cfg: &threads_provider_official::Config,
-    code: &str,
-) -> Result<()> {
+async fn finish_login(provider_cfg: &threads_provider_official::Config, code: &str) -> Result<()> {
     let short = auth::exchange_code(provider_cfg, code)
         .await
         .map_err(|e| anyhow!("exchange code: {e}"))?;
@@ -137,7 +138,11 @@ async fn finish_login(
         .await
         .map_err(|e| anyhow!("upgrade to long-lived: {e}"))?;
 
-    let token = Token::new(long.access_token, long.expires_in);
+    let token = Token::new(
+        long.access_token,
+        long.expires_in,
+        Some(DEFAULT_SCOPES.iter().map(|s| s.to_string()).collect()),
+    );
     TokenStore::new()
         .save(&token)
         .map_err(|e| anyhow!("save token: {e}"))?;
@@ -180,6 +185,9 @@ fn status() -> Result<()> {
             if let Some(exp) = t.expires_in {
                 println!("expires_in:  {exp}s");
             }
+            if let Some(scopes) = t.granted_scopes.as_ref() {
+                println!("scopes:      {}", scopes.join(","));
+            }
             println!("expired:     {}", t.is_expired());
         }
         None => println!("no token; run `threads-cli auth login`"),
@@ -218,10 +226,8 @@ mod tests {
 
     #[test]
     fn parses_full_redirect_url() {
-        let (code, state) = parse_code_from_input(
-            "https://example.com/cb?code=AQx123&state=abc&extra=1",
-        )
-        .unwrap();
+        let (code, state) =
+            parse_code_from_input("https://example.com/cb?code=AQx123&state=abc&extra=1").unwrap();
         assert_eq!(code, "AQx123");
         assert_eq!(state.as_deref(), Some("abc"));
     }
