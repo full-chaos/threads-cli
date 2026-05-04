@@ -30,6 +30,12 @@ pub enum Error {
     #[error("not found: {0}")]
     NotFound(String),
 
+    /// The provider does not support this operation (e.g. `web` provider
+    /// asked to delete). Distinct from network/auth/parse errors so callers
+    /// can route to a clear "your provider can't do that" message.
+    #[error("operation not supported by this provider: {0}")]
+    NotSupported(String),
+
     #[error("{0}")]
     Other(String),
 }
@@ -64,6 +70,10 @@ mod tests {
             "rate limited; retry after Some(30s)"
         );
         assert_eq!(Error::NotFound("post".into()).to_string(), "not found: post");
+        assert_eq!(
+            Error::NotSupported("delete_post".into()).to_string(),
+            "operation not supported by this provider: delete_post"
+        );
     }
 
     #[test]
