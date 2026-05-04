@@ -34,6 +34,9 @@ pub struct Manifest {
     pub objects: Vec<ObjectDef>,
     #[serde(default)]
     pub edges: Vec<EdgeDef>,
+    /// Write operations exposed by the provider manifest.
+    #[serde(default)]
+    pub actions: Vec<Action>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -68,8 +71,29 @@ pub struct EdgeDef {
     pub paginated: bool,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Action {
+    /// Stable action key, e.g. `post/delete`.
+    pub name: String,
+    /// Request path, absolute or relative to the API base URL.
+    pub path: String,
+    /// HTTP method for the write operation.
+    pub method: String,
+    /// OAuth permission required for the action.
+    pub permission: String,
+    /// Whether Meta officially documents the action.
+    #[serde(default = "default_documented")]
+    pub documented: bool,
+    /// Optional provider-enforced daily action limit.
+    pub rate_limit_per_day: Option<u32>,
+}
+
 fn default_get() -> String {
     "GET".to_string()
+}
+
+fn default_documented() -> bool {
+    true
 }
 
 impl Manifest {
@@ -111,6 +135,13 @@ impl Manifest {
             if e.name.is_empty() || e.path.is_empty() {
                 return Err(ManifestError::Invalid(format!(
                     "edge has empty name or path: {e:?}"
+                )));
+            }
+        }
+        for a in &self.actions {
+            if a.name.is_empty() || a.path.is_empty() {
+                return Err(ManifestError::Invalid(format!(
+                    "action has empty name or path: {a:?}"
                 )));
             }
         }
@@ -168,5 +199,30 @@ version = "v1.0"
         let m = Manifest::from_path(path).expect("manifest should parse");
         assert!(m.object("me").is_some(), "manifest must define `me` object");
         assert!(m.edge("me/threads").is_some(), "manifest must define `me/threads` edge");
+    }
+
+    #[test]
+    fn action_round_trips_with_default_documented() {
+        let s = r#"
+[api]
+base_url = "https://graph.threads.net"
+version = "v1.0"
+
+[[actions]]
+name = "post/delete"
+path = "/v1.0/{post-id}"
+method = "DELETE"
+permission = "threads_delete"
+rate_limit_per_day = 100
+"#;
+        let m = Manifest::from_str(s).unwrap();
+        assert_eq!(m.actions.len(), 1);
+        assert!(m.actions[0].documented);
+        assert_eq!(m.actions[0].rate_limit_per_day, Some(100));
+
+        let toml = toml::to_string(&m).unwrap();
+        let reparsed = Manifest::from_str(&toml).unwrap();
+        assert_eq!(reparsed.actions[0].name, "post/delete");
+        assert!(reparsed.actions[0].documented);
     }
 }

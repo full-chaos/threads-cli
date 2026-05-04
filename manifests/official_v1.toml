@@ -111,6 +111,27 @@ fields = [
     "hide_status",
 ]
 
+# ------------------------------------------------------------------
+# Actions (write operations)
+# ------------------------------------------------------------------
+
+[[actions]]
+name = "post/delete"
+path = "/v1.0/{post-id}"
+method = "DELETE"
+permission = "threads_delete"
+documented = true
+# Rate limit: 100 successful deletes per 24h per account (Meta-enforced).
+rate_limit_per_day = 100
+
+[[actions]]
+name = "reply/delete"
+path = "/v1.0/{reply-id}"
+method = "DELETE"
+permission = "threads_delete"
+documented = false  # not officially documented for replies; probe behavior
+rate_limit_per_day = 100
+
 [[edges]]
 name = "post/conversation"
 path = "/v1.0/{post-id}/conversation"
