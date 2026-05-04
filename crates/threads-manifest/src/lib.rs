@@ -195,10 +195,16 @@ version = "v1.0"
 
     #[test]
     fn parses_official_v1_manifest() {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../manifests/official_v1.toml");
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../manifests/official_v1.toml"
+        );
         let m = Manifest::from_path(path).expect("manifest should parse");
         assert!(m.object("me").is_some(), "manifest must define `me` object");
-        assert!(m.edge("me/threads").is_some(), "manifest must define `me/threads` edge");
+        assert!(
+            m.edge("me/threads").is_some(),
+            "manifest must define `me/threads` edge"
+        );
     }
 
     #[test]

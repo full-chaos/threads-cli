@@ -1,6 +1,6 @@
 use std::{path::Path, sync::Arc};
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use threads_core::PostId;
 use threads_ingest::{Ingestor, OfficialNormalizer};
 

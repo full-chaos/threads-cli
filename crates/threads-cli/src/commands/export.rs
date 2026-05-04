@@ -1,12 +1,15 @@
 use std::{
     fs::File,
-    io::{stdout, BufWriter, Write},
+    io::{BufWriter, Write, stdout},
     path::Path,
 };
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 
-use crate::{cli::ExportArgs, output::{render_posts, OutputFormat}};
+use crate::{
+    cli::ExportArgs,
+    output::{OutputFormat, render_posts},
+};
 
 pub fn run(
     args: ExportArgs,

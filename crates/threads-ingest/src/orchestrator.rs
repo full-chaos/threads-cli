@@ -5,20 +5,14 @@
 //! paginates fully, deduplicates by `PostId`, and batch-upserts via
 //! `StoreWrite`.
 
-use std::{
-    collections::HashSet,
-    sync::Arc,
-};
+use std::{collections::HashSet, sync::Arc};
 
 use chrono::Utc;
 use threads_core::{Cursor, FetchRun, PostId, Provider, Result};
 use tracing::info;
 use uuid::Uuid;
 
-use crate::{
-    normalizer::Normalizer,
-    store_shim::StoreWrite,
-};
+use crate::{normalizer::Normalizer, store_shim::StoreWrite};
 
 /// Maximum posts to upsert in a single `StoreWrite::upsert_posts` call.
 const BATCH_SIZE: usize = 100;

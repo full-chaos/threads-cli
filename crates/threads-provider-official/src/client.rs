@@ -26,7 +26,11 @@ impl HttpClient {
             .connect_timeout(Duration::from_secs(10))
             .build()
             .map_err(|e| Error::Network(format!("reqwest client: {e}")))?;
-        Ok(Self { inner, base, token: token.into() })
+        Ok(Self {
+            inner,
+            base,
+            token: token.into(),
+        })
     }
 
     /// GET `path` (absolute or relative to `base`) returning `T`.
@@ -81,7 +85,10 @@ impl HttpClient {
                 .and_then(|s| s.parse::<u64>().ok());
 
             if status.is_success() {
-                let body = resp.text().await.map_err(|e| Error::Network(e.to_string()))?;
+                let body = resp
+                    .text()
+                    .await
+                    .map_err(|e| Error::Network(e.to_string()))?;
                 if let Some(usage) = app_usage.as_deref() {
                     if is_near_limit(usage) {
                         warn!(usage, "threads API near rate limit; client-side backoff");
@@ -164,7 +171,10 @@ impl HttpClient {
                 .and_then(|s| s.parse::<u64>().ok());
 
             if status.is_success() {
-                let body = resp.text().await.map_err(|e| Error::Network(e.to_string()))?;
+                let body = resp
+                    .text()
+                    .await
+                    .map_err(|e| Error::Network(e.to_string()))?;
                 if let Some(usage) = app_usage.as_deref() {
                     if is_near_limit(usage) {
                         warn!(usage, "threads API near rate limit; client-side backoff");
@@ -211,10 +221,10 @@ fn is_near_limit(x_app_usage: &str) -> bool {
         Ok(v) => v,
         Err(_) => return false,
     };
-    let Some(obj) = v.as_object() else { return false };
-    obj.values()
-        .filter_map(|n| n.as_f64())
-        .any(|n| n >= 90.0)
+    let Some(obj) = v.as_object() else {
+        return false;
+    };
+    obj.values().filter_map(|n| n.as_f64()).any(|n| n >= 90.0)
 }
 
 fn backoff(base_ms: u64) -> Duration {

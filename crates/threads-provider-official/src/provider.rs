@@ -134,11 +134,7 @@ impl Provider for OfficialProvider {
         Ok(envelope_to_page(env, None))
     }
 
-    async fn fetch_replies(
-        &self,
-        post_id: &PostId,
-        cursor: Option<Cursor>,
-    ) -> Result<Page<Post>> {
+    async fn fetch_replies(&self, post_id: &PostId, cursor: Option<Cursor>) -> Result<Page<Post>> {
         let path = self
             .edge_path("post/replies")
             .ok_or_else(|| Error::Manifest("missing edge `post/replies`".into()))?;
@@ -352,7 +348,9 @@ mod tests {
             is_quote_post: false,
             owner: None,
             children: None,
-            replied_to: Some(crate::dto::PostRefDto { id: "parent".into() }),
+            replied_to: Some(crate::dto::PostRefDto {
+                id: "parent".into(),
+            }),
             root_post: None,
             is_reply: Some(true),
             shortcode: None,

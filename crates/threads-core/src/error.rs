@@ -64,12 +64,21 @@ mod tests {
 
     #[test]
     fn display_forms_are_human_readable() {
-        assert_eq!(Error::Auth("bad token".into()).to_string(), "authentication error: bad token");
         assert_eq!(
-            Error::RateLimit { retry_after: Some(Duration::from_secs(30)) }.to_string(),
+            Error::Auth("bad token".into()).to_string(),
+            "authentication error: bad token"
+        );
+        assert_eq!(
+            Error::RateLimit {
+                retry_after: Some(Duration::from_secs(30))
+            }
+            .to_string(),
             "rate limited; retry after Some(30s)"
         );
-        assert_eq!(Error::NotFound("post".into()).to_string(), "not found: post");
+        assert_eq!(
+            Error::NotFound("post".into()).to_string(),
+            "not found: post"
+        );
         assert_eq!(
             Error::NotSupported("delete_post".into()).to_string(),
             "operation not supported by this provider: delete_post"
@@ -78,7 +87,9 @@ mod tests {
 
     #[test]
     fn serde_json_error_maps_to_parse() {
-        let err: Error = serde_json::from_str::<u32>("notanumber").unwrap_err().into();
+        let err: Error = serde_json::from_str::<u32>("notanumber")
+            .unwrap_err()
+            .into();
         assert!(matches!(err, Error::Parse(_)));
     }
 

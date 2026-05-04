@@ -599,7 +599,11 @@ pub fn oldest_deletion_in_last_24h(conn: &Connection) -> Result<Option<DateTime<
         .optional()
         .map_err(StoreError::Sqlite)?
         .flatten();
-    Ok(row.and_then(|s| DateTime::parse_from_rfc3339(&s).ok().map(|dt| dt.with_timezone(&Utc))))
+    Ok(row.and_then(|s| {
+        DateTime::parse_from_rfc3339(&s)
+            .ok()
+            .map(|dt| dt.with_timezone(&Utc))
+    }))
 }
 
 // ------------------------------------------------------------------ //

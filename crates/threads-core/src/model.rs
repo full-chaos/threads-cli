@@ -59,7 +59,10 @@ impl<T> Page<T> {
         Self { items, next }
     }
     pub fn empty() -> Self {
-        Self { items: Vec::new(), next: None }
+        Self {
+            items: Vec::new(),
+            next: None,
+        }
     }
 }
 

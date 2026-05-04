@@ -16,11 +16,7 @@ const ACCESS_TOKEN_BASE: &str = "https://graph.threads.net/access_token";
 const REFRESH_BASE: &str = "https://graph.threads.net/refresh_access_token";
 
 /// Default OAuth scopes covering v1 MVP behavior.
-pub const DEFAULT_SCOPES: &[&str] = &[
-    "threads_basic",
-    "threads_read_replies",
-    "threads_delete",
-];
+pub const DEFAULT_SCOPES: &[&str] = &["threads_basic", "threads_read_replies", "threads_delete"];
 
 /// Build the URL the user must visit to grant authorization.
 pub fn authorize_url(cfg: &Config, scopes: &[&str], state: &str) -> Result<Url> {
@@ -117,7 +113,10 @@ pub async fn refresh_long_lived(_cfg: &Config, token: &str) -> Result<TokenRespo
 
 async fn parse_token_response(resp: reqwest::Response) -> Result<TokenResponse> {
     let status = resp.status();
-    let body = resp.text().await.map_err(|e| Error::Network(e.to_string()))?;
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| Error::Network(e.to_string()))?;
     if !status.is_success() {
         return Err(Error::Auth(format!("token endpoint {status}: {body}")));
     }
@@ -160,7 +159,10 @@ impl CallbackServer {
             format!("/{path}")
         };
         let redirect_uri = format!("http://127.0.0.1:{port}{p}");
-        Ok(Self { listener, redirect_uri })
+        Ok(Self {
+            listener,
+            redirect_uri,
+        })
     }
 
     /// Bind to the exact host+port in `configured_uri` so the redirect URI
@@ -293,7 +295,11 @@ fn percent_decode(s: &str) -> String {
     out
 }
 
-async fn respond_html(sock: &mut tokio::net::TcpStream, status: u16, body: &str) -> std::io::Result<()> {
+async fn respond_html(
+    sock: &mut tokio::net::TcpStream,
+    status: u16,
+    body: &str,
+) -> std::io::Result<()> {
     let reason = match status {
         200 => "OK",
         400 => "Bad Request",

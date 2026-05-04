@@ -38,7 +38,9 @@ impl Token {
     pub fn is_expired(&self) -> bool {
         match self.expires_in {
             Some(secs) if secs > 0 => {
-                let elapsed = Utc::now().signed_duration_since(self.issued_at).num_seconds();
+                let elapsed = Utc::now()
+                    .signed_duration_since(self.issued_at)
+                    .num_seconds();
                 elapsed >= secs
             }
             _ => false,
@@ -238,7 +240,10 @@ mod tests {
         store.save(&t).unwrap();
         let loaded = store.load().unwrap().expect("token should load");
         assert_eq!(loaded.access_token, "abcd");
-        assert_eq!(loaded.granted_scopes.as_deref(), Some(&["threads_basic".to_string()][..]));
+        assert_eq!(
+            loaded.granted_scopes.as_deref(),
+            Some(&["threads_basic".to_string()][..])
+        );
         store.clear().unwrap();
     }
 
@@ -256,10 +261,9 @@ mod tests {
         // A token saved before scope tracking shipped has `granted_scopes = None`.
         // For new write scopes like `threads_delete`, that MUST read as missing
         // so the CLI can guide the user to re-run `auth login`.
-        let t: Token = serde_json::from_str(
-            r#"{"access_token":"t","issued_at":"2026-01-01T00:00:00Z"}"#,
-        )
-        .unwrap();
+        let t: Token =
+            serde_json::from_str(r#"{"access_token":"t","issued_at":"2026-01-01T00:00:00Z"}"#)
+                .unwrap();
 
         assert!(t.granted_scopes.is_none());
         assert!(!token_has_scope(&t, "threads_delete"));
@@ -291,13 +295,23 @@ mod tests {
         // would fail — but keyring may still succeed on dev machines. To
         // guarantee the file write path runs, call the helpers directly.
         create_private_dir(&dir).unwrap();
-        write_private_file(&file, b"{\"access_token\":\"t\",\"issued_at\":\"2026-01-01T00:00:00Z\"}").unwrap();
+        write_private_file(
+            &file,
+            b"{\"access_token\":\"t\",\"issued_at\":\"2026-01-01T00:00:00Z\"}",
+        )
+        .unwrap();
 
         let dir_mode = fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
-        assert_eq!(dir_mode, 0o700, "parent dir should be 0700, got {dir_mode:o}");
+        assert_eq!(
+            dir_mode, 0o700,
+            "parent dir should be 0700, got {dir_mode:o}"
+        );
 
         let file_mode = fs::metadata(&file).unwrap().permissions().mode() & 0o777;
-        assert_eq!(file_mode, 0o600, "token file should be 0600, got {file_mode:o}");
+        assert_eq!(
+            file_mode, 0o600,
+            "token file should be 0600, got {file_mode:o}"
+        );
 
         // Keep the store struct alive so `with_fallback_path` isn't dead-code.
         let _ = store;
@@ -318,7 +332,10 @@ mod tests {
         create_private_dir(&dir).unwrap();
 
         let mode = fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o700, "loose dir should have been tightened to 0700, got {mode:o}");
+        assert_eq!(
+            mode, 0o700,
+            "loose dir should have been tightened to 0700, got {mode:o}"
+        );
     }
 
     #[cfg(unix)]
@@ -336,6 +353,9 @@ mod tests {
         write_private_file(&file, b"{}").unwrap();
 
         let mode = fs::metadata(&file).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600, "loose file should have been tightened to 0600, got {mode:o}");
+        assert_eq!(
+            mode, 0o600,
+            "loose file should have been tightened to 0600, got {mode:o}"
+        );
     }
 }

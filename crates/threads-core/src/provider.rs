@@ -31,11 +31,7 @@ pub trait Provider: Send + Sync {
     }
 
     /// One page of replies to a given post.
-    async fn fetch_replies(
-        &self,
-        post_id: &PostId,
-        cursor: Option<Cursor>,
-    ) -> Result<Page<Post>>;
+    async fn fetch_replies(&self, post_id: &PostId, cursor: Option<Cursor>) -> Result<Page<Post>>;
 
     /// Full conversation (root + descendants) for a thread root id.
     async fn fetch_thread(&self, root_id: &PostId) -> Result<Vec<Post>>;

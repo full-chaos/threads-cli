@@ -47,7 +47,9 @@ impl CliConfig {
     }
 
     pub fn default_config_path() -> PathBuf {
-        Self::xdg_config_home().join("threads-cli").join("config.toml")
+        Self::xdg_config_home()
+            .join("threads-cli")
+            .join("config.toml")
     }
 
     pub fn default_db_path() -> PathBuf {
@@ -59,7 +61,9 @@ impl CliConfig {
     }
 
     pub fn token_path() -> PathBuf {
-        Self::xdg_config_home().join("threads-cli").join("token.json")
+        Self::xdg_config_home()
+            .join("threads-cli")
+            .join("token.json")
     }
 
     /// Load config, applying env overrides on top of the file contents.
@@ -95,8 +99,7 @@ impl CliConfig {
 
     pub fn save_to(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("creating {}", parent.display()))?;
+            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
         }
         let s = toml::to_string_pretty(self)?;
         fs::write(path, s).with_context(|| format!("writing {}", path.display()))?;
@@ -145,7 +148,12 @@ mod tests {
         // Runs in parallel with env_overrides_file_values which mutates
         // process env. Explicitly unset the vars we care about so load()
         // returns the file's values deterministically.
-        for k in ["THREADS_APP_ID", "THREADS_APP_SECRET", "THREADS_REDIRECT_URI", "THREADS_DB_PATH"] {
+        for k in [
+            "THREADS_APP_ID",
+            "THREADS_APP_SECRET",
+            "THREADS_REDIRECT_URI",
+            "THREADS_DB_PATH",
+        ] {
             unsafe { std::env::remove_var(k) };
         }
         let tmp = TempDir::new().unwrap();

@@ -603,7 +603,11 @@ mod tests {
         c.parent_id = Some(PostId::new("P"));
         store.upsert_post(&c, None).unwrap();
 
-        assert_eq!(count_edges_from(&store, "P"), 3, "P should own 3 outbound edges");
+        assert_eq!(
+            count_edges_from(&store, "P"),
+            3,
+            "P should own 3 outbound edges"
+        );
         let inbound_to_p: i64 = {
             let conn = store.raw_conn();
             conn.query_row(
@@ -617,7 +621,11 @@ mod tests {
 
         // Delete P. Both directions of edges referencing P must vanish.
         assert!(store.delete_post(&PostId::new("P")).unwrap());
-        assert_eq!(count_edges_from(&store, "P"), 0, "outbound edges from P should be gone");
+        assert_eq!(
+            count_edges_from(&store, "P"),
+            0,
+            "outbound edges from P should be gone"
+        );
         let inbound_to_p_after: i64 = {
             let conn = store.raw_conn();
             conn.query_row(
@@ -627,7 +635,10 @@ mod tests {
             )
             .unwrap()
         };
-        assert_eq!(inbound_to_p_after, 0, "inbound edges pointing at P should be gone");
+        assert_eq!(
+            inbound_to_p_after, 0,
+            "inbound edges pointing at P should be gone"
+        );
 
         // C itself should still exist (we only deleted P).
         assert!(store.get_post(&PostId::new("C")).unwrap().is_some());

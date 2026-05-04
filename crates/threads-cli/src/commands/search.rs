@@ -1,8 +1,11 @@
 use std::{io::stdout, path::Path};
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 
-use crate::{cli::SearchArgs, output::{render_posts, OutputFormat}};
+use crate::{
+    cli::SearchArgs,
+    output::{OutputFormat, render_posts},
+};
 
 pub fn run(
     args: SearchArgs,
@@ -17,7 +20,9 @@ pub fn run(
     // FTS5 MATCH rejects "*" alone, and asking users to pick a dummy token
     // is ceremony the store already avoids via list_posts.
     let posts = if args.query.trim().is_empty() || args.query.trim() == "*" {
-        store.list_posts(args.limit).map_err(|e| anyhow!("list posts: {e}"))?
+        store
+            .list_posts(args.limit)
+            .map_err(|e| anyhow!("list posts: {e}"))?
     } else {
         store
             .search_text(&args.query, args.limit)
