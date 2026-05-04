@@ -113,15 +113,16 @@ pub async fn refresh_long_lived(_cfg: &Config, token: &str) -> Result<TokenRespo
 
 async fn parse_token_response(resp: reqwest::Response) -> Result<TokenResponse> {
     let status = resp.status();
-    let body = resp
+    let raw_body = resp
         .text()
         .await
         .map_err(|e| Error::Network(e.to_string()))?;
+    let safe_body = crate::redact::redact(&raw_body);
     if !status.is_success() {
-        return Err(Error::Auth(format!("token endpoint {status}: {body}")));
+        return Err(Error::Auth(format!("token endpoint {status}: {safe_body}")));
     }
-    serde_json::from_str(&body)
-        .map_err(|e| Error::Parse(format!("token response: {e}; body: {body}")))
+    serde_json::from_str(&raw_body)
+        .map_err(|e| Error::Parse(format!("token response: {e}; body: {safe_body}")))
 }
 
 /// Run a one-shot local HTTP server that receives Meta's redirect after the

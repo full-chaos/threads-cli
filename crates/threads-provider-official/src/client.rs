@@ -5,6 +5,8 @@ use threads_core::{Error, Result};
 use tracing::{debug, warn};
 use url::Url;
 
+use crate::redact;
+
 /// Low-level HTTP client for `https://graph.threads.net`.
 ///
 /// - Automatically appends `access_token` on every request.
@@ -97,7 +99,7 @@ impl HttpClient {
                 return serde_json::from_str(&body).map_err(Error::from);
             }
 
-            let body = resp.text().await.unwrap_or_default();
+            let body = redact::redact(&resp.text().await.unwrap_or_default());
             match status.as_u16() {
                 401 | 403 => return Err(Error::Auth(format!("{status}: {body}"))),
                 404 => return Err(Error::NotFound(body)),
@@ -186,7 +188,7 @@ impl HttpClient {
                 return serde_json::from_str(&body).map_err(Error::from);
             }
 
-            let body = resp.text().await.unwrap_or_default();
+            let body = redact::redact(&resp.text().await.unwrap_or_default());
             match status.as_u16() {
                 401 | 403 => return Err(Error::Auth(format!("{status}: {body}"))),
                 404 => return Err(Error::NotFound(body)),

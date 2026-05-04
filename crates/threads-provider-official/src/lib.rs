@@ -13,6 +13,7 @@ pub mod client;
 pub mod config;
 pub mod dto;
 pub mod provider;
+pub(crate) mod redact;
 pub mod token_store;
 
 pub use config::Config;
