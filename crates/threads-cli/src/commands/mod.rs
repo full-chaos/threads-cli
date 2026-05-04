@@ -1,16 +1,22 @@
 use std::sync::Arc;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use threads_manifest::Manifest;
-use threads_provider_official::{client::HttpClient, Config as ProviderConfig, OfficialProvider, TokenStore};
+use threads_provider_official::{
+    Config as ProviderConfig, OfficialProvider, TokenStore, client::HttpClient,
+};
 use threads_store::Store;
 
-use crate::{cli::{Cli, Command}, config::CliConfig};
+use crate::{
+    cli::{Cli, Command},
+    config::CliConfig,
+};
 
 pub mod auth;
+pub mod delete;
 pub mod export;
-pub mod init;
 pub mod ingest;
+pub mod init;
 pub mod search;
 pub mod show;
 
@@ -24,9 +30,25 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
         Command::Init(args) => init::run(args, cli.config.as_deref()),
         Command::Auth(cmd) => auth::run(cmd, cli.config.as_deref()).await,
         Command::Ingest(cmd) => ingest::run(cmd, cli.config.as_deref(), cli.db.as_deref()).await,
-        Command::Show(args) => show::run(args, cli.config.as_deref(), cli.db.as_deref(), cli.format.into()),
-        Command::Search(args) => search::run(args, cli.config.as_deref(), cli.db.as_deref(), cli.format.into()),
-        Command::Export(args) => export::run(args, cli.config.as_deref(), cli.db.as_deref(), cli.format.into()),
+        Command::Show(args) => show::run(
+            args,
+            cli.config.as_deref(),
+            cli.db.as_deref(),
+            cli.format.into(),
+        ),
+        Command::Search(args) => search::run(
+            args,
+            cli.config.as_deref(),
+            cli.db.as_deref(),
+            cli.format.into(),
+        ),
+        Command::Export(args) => export::run(
+            args,
+            cli.config.as_deref(),
+            cli.db.as_deref(),
+            cli.format.into(),
+        ),
+        Command::Delete(cmd) => delete::run(cmd, cli.config.as_deref(), cli.db.as_deref()).await,
     }
 }
 
@@ -65,8 +87,14 @@ pub async fn open_provider(_cfg: &CliConfig) -> Result<OfficialProvider> {
 
 pub fn provider_config(cfg: &CliConfig) -> Result<ProviderConfig> {
     Ok(ProviderConfig {
-        app_id: cfg.app_id.clone().ok_or_else(|| anyhow!("app_id not set — run `threads-cli init`"))?,
-        app_secret: cfg.app_secret.clone().ok_or_else(|| anyhow!("app_secret not set"))?,
+        app_id: cfg
+            .app_id
+            .clone()
+            .ok_or_else(|| anyhow!("app_id not set — run `threads-cli init`"))?,
+        app_secret: cfg
+            .app_secret
+            .clone()
+            .ok_or_else(|| anyhow!("app_secret not set"))?,
         redirect_uri: cfg
             .redirect_uri
             .clone()

@@ -1,9 +1,12 @@
 use std::{io::stdout, path::Path};
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use threads_core::PostId;
 
-use crate::{cli::ShowArgs, output::{render_posts, OutputFormat}};
+use crate::{
+    cli::ShowArgs,
+    output::{OutputFormat, render_posts},
+};
 
 pub fn run(
     args: ShowArgs,

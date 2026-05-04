@@ -110,7 +110,10 @@ mod tests {
         }"#;
         let e: Envelope<PostDto> = serde_json::from_str(v).unwrap();
         assert_eq!(e.data.len(), 2);
-        assert_eq!(e.paging.unwrap().cursors.unwrap().after.as_deref(), Some("CURSOR"));
+        assert_eq!(
+            e.paging.unwrap().cursors.unwrap().after.as_deref(),
+            Some("CURSOR")
+        );
     }
 
     #[test]

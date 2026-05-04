@@ -37,18 +37,36 @@ cargo build --workspace
 cargo test  --workspace
 ```
 
-## Planned commands (v1, read-only)
+## Commands
+
+Read-only ingest + query (always safe):
 
 ```
 threads-cli init
-threads-cli auth login | status
-threads-cli ingest me | thread <post_id>
+threads-cli auth login | status | logout
+threads-cli ingest me | thread <post_id> | engagement [--depth N]
 threads-cli show <post_id> [--thread]
 threads-cli search "<query>"
 threads-cli export --format json|jsonl|csv
 ```
 
-Publishing (`threads_publish`), multi-account, and the private
+Destructive remote ops (dry-run by default; `--apply` actually performs the
+delete via Meta's `DELETE /v1.0/{id}` endpoint):
+
+```
+threads-cli delete posts   [--before <date>] [--after <date>] [--apply] [--limit N]
+threads-cli delete replies [--before <date>] [--after <date>] [--apply] [--limit N] [--yes-undocumented]
+```
+
+Filtering uses `posts.created_at` from the local store; `--before`/`--after`
+accept either RFC 3339 (`2025-01-15T00:00:00Z`) or bare ISO date
+(`2025-01-15`). The Threads API enforces a hard cap of 100 deletions per
+24h; `delete` refuses cleanly when the cap is reached and reports when the
+quota will reset. See [`docs/plans/delete.md`](docs/plans/delete.md) for the
+full design.
+
+Publishing (`threads_publish`), `archive` (Meta does not expose a remote
+archive endpoint for root posts), multi-account, and the private
 `threads.net/api/graphql` adapter are deferred past v1.
 
 ## License

@@ -15,11 +15,8 @@ const TOKEN_EXCHANGE_BASE: &str = "https://graph.threads.net/oauth/access_token"
 const ACCESS_TOKEN_BASE: &str = "https://graph.threads.net/access_token";
 const REFRESH_BASE: &str = "https://graph.threads.net/refresh_access_token";
 
-/// Default OAuth scopes covering read-only v1 MVP behavior.
-pub const DEFAULT_SCOPES: &[&str] = &[
-    "threads_basic",
-    "threads_read_replies",
-];
+/// Default OAuth scopes covering v1 MVP behavior.
+pub const DEFAULT_SCOPES: &[&str] = &["threads_basic", "threads_read_replies", "threads_delete"];
 
 /// Build the URL the user must visit to grant authorization.
 pub fn authorize_url(cfg: &Config, scopes: &[&str], state: &str) -> Result<Url> {
@@ -116,12 +113,16 @@ pub async fn refresh_long_lived(_cfg: &Config, token: &str) -> Result<TokenRespo
 
 async fn parse_token_response(resp: reqwest::Response) -> Result<TokenResponse> {
     let status = resp.status();
-    let body = resp.text().await.map_err(|e| Error::Network(e.to_string()))?;
+    let raw_body = resp
+        .text()
+        .await
+        .map_err(|e| Error::Network(e.to_string()))?;
+    let safe_body = crate::redact::redact(&raw_body);
     if !status.is_success() {
-        return Err(Error::Auth(format!("token endpoint {status}: {body}")));
+        return Err(Error::Auth(format!("token endpoint {status}: {safe_body}")));
     }
-    serde_json::from_str(&body)
-        .map_err(|e| Error::Parse(format!("token response: {e}; body: {body}")))
+    serde_json::from_str(&raw_body)
+        .map_err(|e| Error::Parse(format!("token response: {e}; body: {safe_body}")))
 }
 
 /// Run a one-shot local HTTP server that receives Meta's redirect after the
@@ -159,7 +160,10 @@ impl CallbackServer {
             format!("/{path}")
         };
         let redirect_uri = format!("http://127.0.0.1:{port}{p}");
-        Ok(Self { listener, redirect_uri })
+        Ok(Self {
+            listener,
+            redirect_uri,
+        })
     }
 
     /// Bind to the exact host+port in `configured_uri` so the redirect URI
@@ -292,7 +296,11 @@ fn percent_decode(s: &str) -> String {
     out
 }
 
-async fn respond_html(sock: &mut tokio::net::TcpStream, status: u16, body: &str) -> std::io::Result<()> {
+async fn respond_html(
+    sock: &mut tokio::net::TcpStream,
+    status: u16,
+    body: &str,
+) -> std::io::Result<()> {
     let reason = match status {
         200 => "OK",
         400 => "Bad Request",
@@ -330,6 +338,11 @@ mod tests {
         assert_eq!(q["redirect_uri"], "https://localhost/cb");
         assert_eq!(q["scope"], "threads_basic,threads_read_replies");
         assert_eq!(q["state"], "xyz");
+    }
+
+    #[test]
+    fn default_scopes_include_delete_permission() {
+        assert!(DEFAULT_SCOPES.contains(&"threads_delete"));
     }
 
     #[test]

@@ -53,8 +53,7 @@ impl StoreWrite for threads_store::Store {
         posts_fetched: u64,
         error: Option<&str>,
     ) -> Result<()> {
-        Self::record_fetch_run_end(self, id, finished_at, posts_fetched, error)
-            .map_err(Into::into)
+        Self::record_fetch_run_end(self, id, finished_at, posts_fetched, error).map_err(Into::into)
     }
 
     fn get_post(&self, id: &PostId) -> Result<Option<Post>> {

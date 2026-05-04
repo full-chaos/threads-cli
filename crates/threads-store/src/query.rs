@@ -1,8 +1,9 @@
 use chrono::{DateTime, Utc};
-use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use threads_core::model::{
     EdgeKind, FetchRun, Media, MediaKind, Mention, Post, PostId, UrlEntity, User, UserId,
 };
+use tracing::warn;
 
 use crate::error::{Result, StoreError};
 
@@ -117,12 +118,21 @@ fn upsert_post_tx(tx: &Transaction, post: &Post, fetch_run_id: Option<&str>) -> 
     .map_err(StoreError::Sqlite)?;
 
     // Delete old child rows before re-inserting (simpler than diffing).
-    tx.execute("DELETE FROM media WHERE post_id = ?1", params![post.id.as_str()])
-        .map_err(StoreError::Sqlite)?;
-    tx.execute("DELETE FROM urls WHERE post_id = ?1", params![post.id.as_str()])
-        .map_err(StoreError::Sqlite)?;
-    tx.execute("DELETE FROM mentions WHERE post_id = ?1", params![post.id.as_str()])
-        .map_err(StoreError::Sqlite)?;
+    tx.execute(
+        "DELETE FROM media WHERE post_id = ?1",
+        params![post.id.as_str()],
+    )
+    .map_err(StoreError::Sqlite)?;
+    tx.execute(
+        "DELETE FROM urls WHERE post_id = ?1",
+        params![post.id.as_str()],
+    )
+    .map_err(StoreError::Sqlite)?;
+    tx.execute(
+        "DELETE FROM mentions WHERE post_id = ?1",
+        params![post.id.as_str()],
+    )
+    .map_err(StoreError::Sqlite)?;
     // Also drop existing edges OWNED by this post (`from_id = post.id`) for
     // the kinds we manage here. Without this, reingesting a post whose
     // parent_id / root_id / mentions changed would LEAVE behind stale
@@ -140,7 +150,12 @@ fn upsert_post_tx(tx: &Transaction, post: &Post, fetch_run_id: Option<&str>) -> 
     for m in &post.media {
         tx.execute(
             "INSERT INTO media (post_id, kind, url, thumbnail_url) VALUES (?1, ?2, ?3, ?4)",
-            params![post.id.as_str(), media_kind_str(&m.kind), m.url, m.thumbnail_url],
+            params![
+                post.id.as_str(),
+                media_kind_str(&m.kind),
+                m.url,
+                m.thumbnail_url
+            ],
         )
         .map_err(StoreError::Sqlite)?;
     }
@@ -254,7 +269,8 @@ fn load_post(conn: &Connection, id: &str) -> Result<Option<Post>> {
         Option<String>,
         i32,
     );
-    let row: Option<PostRow> = conn.query_row(
+    let row: Option<PostRow> = conn
+        .query_row(
             "SELECT author_id, text, created_at, parent_id, root_id, permalink, is_quote_post
              FROM posts WHERE id = ?1",
             params![id],
@@ -288,7 +304,11 @@ fn load_post(conn: &Connection, id: &str) -> Result<Option<Post>> {
         .map_err(StoreError::Sqlite)?;
     let media: Vec<Media> = media_stmt
         .query_map(params![id], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?, row.get::<_, Option<String>>(2)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
         })
         .map_err(StoreError::Sqlite)?
         .filter_map(|r| r.ok())
@@ -383,6 +403,207 @@ pub fn list_posts(conn: &Connection, limit: usize) -> Result<Vec<Post>> {
         }
     }
     Ok(posts)
+}
+
+// ----- Deletions -----
+
+/// Selects whether deletion candidate queries return top-level posts or replies.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PostKind {
+    Post,
+    Reply,
+}
+
+impl PostKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            PostKind::Post => "post",
+            PostKind::Reply => "reply",
+        }
+    }
+}
+
+/// Posts in [after, before) authored by `author`, matched on non-NULL `created_at`.
+/// `kind` selects root posts (parent_id IS NULL) vs replies (parent_id NOT NULL).
+pub fn posts_in_window(
+    conn: &Connection,
+    author: &UserId,
+    after: Option<DateTime<Utc>>,
+    before: Option<DateTime<Utc>>,
+    kind: PostKind,
+    limit: usize,
+) -> Result<Vec<Post>> {
+    let parent_filter = match kind {
+        PostKind::Post => "parent_id IS NULL",
+        PostKind::Reply => "parent_id IS NOT NULL",
+    };
+    let after = after.map(|dt| dt.to_rfc3339());
+    let before = before.map(|dt| dt.to_rfc3339());
+
+    let ids: Vec<String> = match (after.as_deref(), before.as_deref()) {
+        (Some(after), Some(before)) => {
+            let sql = format!(
+                "SELECT id FROM posts
+                 WHERE author_id = ?1
+                   AND created_at IS NOT NULL
+                   AND {parent_filter}
+                   AND created_at >= ?2
+                   AND created_at < ?3
+                 ORDER BY created_at ASC
+                 LIMIT ?4"
+            );
+            let mut stmt = conn.prepare(&sql).map_err(StoreError::Sqlite)?;
+            stmt.query_map(
+                params![author.as_str(), after, before, limit as i64],
+                |row| row.get(0),
+            )
+            .map_err(StoreError::Sqlite)?
+            .filter_map(|r| r.ok())
+            .collect()
+        }
+        (Some(after), None) => {
+            let sql = format!(
+                "SELECT id FROM posts
+                 WHERE author_id = ?1
+                   AND created_at IS NOT NULL
+                   AND {parent_filter}
+                   AND created_at >= ?2
+                 ORDER BY created_at ASC
+                 LIMIT ?3"
+            );
+            let mut stmt = conn.prepare(&sql).map_err(StoreError::Sqlite)?;
+            stmt.query_map(params![author.as_str(), after, limit as i64], |row| {
+                row.get(0)
+            })
+            .map_err(StoreError::Sqlite)?
+            .filter_map(|r| r.ok())
+            .collect()
+        }
+        (None, Some(before)) => {
+            let sql = format!(
+                "SELECT id FROM posts
+                 WHERE author_id = ?1
+                   AND created_at IS NOT NULL
+                   AND {parent_filter}
+                   AND created_at < ?2
+                 ORDER BY created_at ASC
+                 LIMIT ?3"
+            );
+            let mut stmt = conn.prepare(&sql).map_err(StoreError::Sqlite)?;
+            stmt.query_map(params![author.as_str(), before, limit as i64], |row| {
+                row.get(0)
+            })
+            .map_err(StoreError::Sqlite)?
+            .filter_map(|r| r.ok())
+            .collect()
+        }
+        (None, None) => {
+            let sql = format!(
+                "SELECT id FROM posts
+                 WHERE author_id = ?1
+                   AND created_at IS NOT NULL
+                   AND {parent_filter}
+                 ORDER BY created_at ASC
+                 LIMIT ?2"
+            );
+            let mut stmt = conn.prepare(&sql).map_err(StoreError::Sqlite)?;
+            stmt.query_map(params![author.as_str(), limit as i64], |row| row.get(0))
+                .map_err(StoreError::Sqlite)?
+                .filter_map(|r| r.ok())
+                .collect()
+        }
+    };
+
+    let mut posts = Vec::with_capacity(ids.len());
+    for id in ids {
+        if let Some(post) = load_post(conn, &id)? {
+            posts.push(post);
+        }
+    }
+    Ok(posts)
+}
+
+/// Hard-delete a post by id.
+///
+/// `media`, `urls`, `mentions`, and `raw_payloads` are removed by SQLite
+/// foreign-key CASCADE (declared in migration v1). The `edges` table has no
+/// FK to `posts`, so we DELETE its rows in both directions explicitly,
+/// otherwise stale edges would orphan the recursive-CTE thread traversal.
+///
+/// Idempotent: returns `Ok(false)` if the row was not present.
+/// Wrapped in a single transaction so a partial failure leaves nothing
+/// half-deleted.
+pub fn delete_post(conn: &mut Connection, id: &PostId) -> Result<bool> {
+    let tx = conn.transaction().map_err(StoreError::Sqlite)?;
+    // `edges` has no ON DELETE CASCADE; clear both endpoints manually.
+    tx.execute(
+        "DELETE FROM edges WHERE from_id = ?1 OR to_id = ?1",
+        params![id.as_str()],
+    )
+    .map_err(StoreError::Sqlite)?;
+    let n = tx
+        .execute("DELETE FROM posts WHERE id = ?1", params![id.as_str()])
+        .map_err(StoreError::Sqlite)?;
+    tx.commit().map_err(StoreError::Sqlite)?;
+    Ok(n > 0)
+}
+
+/// Append a row to `deletions`. NEVER fails the caller if the audit insert
+/// fails — log and continue (loss of audit must not abort actual deletion).
+pub fn record_deletion(
+    conn: &Connection,
+    id: &PostId,
+    kind: PostKind,
+    success: bool,
+    error: Option<&str>,
+) -> Result<()> {
+    let now = Utc::now().to_rfc3339();
+    if let Err(err) = conn.execute(
+        "INSERT INTO deletions (post_id, kind, deleted_at, success, error)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![id.as_str(), kind.as_str(), now, success as i32, error],
+    ) {
+        warn!(post_id = id.as_str(), error = %err, "failed to record deletion audit row");
+    }
+    Ok(())
+}
+
+/// Count rows in `deletions` with deleted_at >= now - 24h AND success = 1.
+/// Used for the 100/24h pre-flight rate-limit check.
+pub fn deletions_in_last_24h(conn: &Connection) -> Result<u64> {
+    let cutoff = (Utc::now() - chrono::Duration::hours(24)).to_rfc3339();
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM deletions WHERE deleted_at >= ?1 AND success = 1",
+            params![cutoff],
+            |row| row.get(0),
+        )
+        .map_err(StoreError::Sqlite)?;
+    Ok(count as u64)
+}
+
+/// Return the timestamp of the OLDEST successful deletion still inside the
+/// 24h window, or `None` if there have been no recent successful deletions.
+///
+/// CLI uses this to render `quota resets at <oldest + 24h>` when the cap is
+/// hit, so the user can see exactly when the next slot opens up.
+pub fn oldest_deletion_in_last_24h(conn: &Connection) -> Result<Option<DateTime<Utc>>> {
+    let cutoff = (Utc::now() - chrono::Duration::hours(24)).to_rfc3339();
+    let row: Option<String> = conn
+        .query_row(
+            "SELECT MIN(deleted_at) FROM deletions
+             WHERE deleted_at >= ?1 AND success = 1",
+            params![cutoff],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(StoreError::Sqlite)?
+        .flatten();
+    Ok(row.and_then(|s| {
+        DateTime::parse_from_rfc3339(&s)
+            .ok()
+            .map(|dt| dt.with_timezone(&Utc))
+    }))
 }
 
 // ------------------------------------------------------------------ //

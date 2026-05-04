@@ -21,6 +21,10 @@ fn migrations() -> Vec<Migration> {
             version: 2,
             apply: migration_v2_fts,
         },
+        Migration {
+            version: 3,
+            apply: migration_v3_deletions,
+        },
     ]
 }
 
@@ -137,6 +141,25 @@ fn migration_v2_fts(conn: &Connection) -> Result<()> {
             INSERT INTO posts_fts(posts_fts, rowid, text) VALUES ('delete', old.rowid, old.text);
             INSERT INTO posts_fts(rowid, text) VALUES (new.rowid, new.text);
         END;
+        ",
+    )
+    .map_err(StoreError::Sqlite)
+}
+
+/// V3: deletion audit rows for remote delete operations.
+fn migration_v3_deletions(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS deletions (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            post_id      TEXT    NOT NULL,
+            kind         TEXT    NOT NULL CHECK (kind IN ('post','reply')),
+            deleted_at   TEXT    NOT NULL,
+            success      INTEGER NOT NULL DEFAULT 1,
+            error        TEXT
+        );
+        CREATE INDEX IF NOT EXISTS deletions_deleted_at_idx ON deletions(deleted_at);
+        CREATE INDEX IF NOT EXISTS deletions_post_idx       ON deletions(post_id);
         ",
     )
     .map_err(StoreError::Sqlite)

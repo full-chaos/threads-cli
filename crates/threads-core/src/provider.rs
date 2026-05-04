@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 
-use crate::{Cursor, Page, Post, PostId, Result, User};
+use crate::{Cursor, Error, Page, Post, PostId, Result, User};
 
 /// The central abstraction for any Threads data source.
 ///
@@ -31,12 +31,22 @@ pub trait Provider: Send + Sync {
     }
 
     /// One page of replies to a given post.
-    async fn fetch_replies(
-        &self,
-        post_id: &PostId,
-        cursor: Option<Cursor>,
-    ) -> Result<Page<Post>>;
+    async fn fetch_replies(&self, post_id: &PostId, cursor: Option<Cursor>) -> Result<Page<Post>>;
 
     /// Full conversation (root + descendants) for a thread root id.
     async fn fetch_thread(&self, root_id: &PostId) -> Result<Vec<Post>>;
+
+    /// Delete a post owned by the authenticated user.
+    /// Default impl returns `Error::NotSupported`.
+    async fn delete_post(&self, _post_id: &PostId) -> Result<()> {
+        Err(Error::NotSupported("delete_post".into()))
+    }
+
+    /// Delete a reply owned by the authenticated user.
+    /// NOTE: undocumented for replies; replies are media objects so the same
+    /// DELETE /{id} path is expected to work, but verify on a test reply.
+    /// Default impl returns `Error::NotSupported`.
+    async fn delete_reply(&self, _reply_id: &PostId) -> Result<()> {
+        Err(Error::NotSupported("delete_reply".into()))
+    }
 }

@@ -11,11 +11,7 @@ use threads_ingest::{Ingestor, NormalizeError, Normalizer, OfficialNormalizer, S
 // ---------- Fixtures (loaded from files) ----------
 
 fn fixture(name: &str) -> serde_json::Value {
-    let path = format!(
-        "{}/tests/fixtures/{}",
-        env!("CARGO_MANIFEST_DIR"),
-        name
-    );
+    let path = format!("{}/tests/fixtures/{}", env!("CARGO_MANIFEST_DIR"), name);
     let text = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("cannot read fixture {path}: {e}"));
     serde_json::from_str(&text).unwrap_or_else(|e| panic!("invalid JSON in {path}: {e}"))
@@ -59,7 +55,9 @@ fn normalize_user_missing_id_returns_error() {
 fn normalize_page_me_threads_json() {
     let raw = fixture("me_threads.json");
     let norm = OfficialNormalizer;
-    let (posts, next) = norm.normalize_page(&raw, None).expect("normalize_page failed");
+    let (posts, next) = norm
+        .normalize_page(&raw, None)
+        .expect("normalize_page failed");
 
     assert_eq!(posts.len(), 3, "expected 3 posts");
     assert_eq!(next.as_deref(), Some("cursor_after_xyz"));
@@ -79,7 +77,9 @@ fn normalize_page_no_next_cursor_when_after_is_null() {
     let raw = fixture("replies.json");
     let norm = OfficialNormalizer;
     // replies.json has "after": null
-    let (posts, next) = norm.normalize_page(&raw, None).expect("normalize_page failed");
+    let (posts, next) = norm
+        .normalize_page(&raw, None)
+        .expect("normalize_page failed");
     assert_eq!(posts.len(), 2);
     // null value → next_cursor = None
     assert!(next.is_none(), "next should be None when after is null");
@@ -89,7 +89,9 @@ fn normalize_page_no_next_cursor_when_after_is_null() {
 fn normalize_post_parent_and_root_edges_from_replies_json() {
     let raw = fixture("replies.json");
     let norm = OfficialNormalizer;
-    let (posts, _) = norm.normalize_page(&raw, None).expect("normalize_page failed");
+    let (posts, _) = norm
+        .normalize_page(&raw, None)
+        .expect("normalize_page failed");
 
     let reply = &posts[0];
     assert_eq!(reply.id, PostId::new("reply_001"));
@@ -270,11 +272,7 @@ impl threads_core::Provider for MockProvider {
         Ok(Page::new(items, next))
     }
 
-    async fn fetch_replies(
-        &self,
-        post_id: &PostId,
-        _cursor: Option<Cursor>,
-    ) -> Result<Page<Post>> {
+    async fn fetch_replies(&self, post_id: &PostId, _cursor: Option<Cursor>) -> Result<Page<Post>> {
         match self.replies.get(post_id) {
             Some(items) => Ok(Page::new(items.clone(), None)),
             None => Ok(Page::empty()),
@@ -355,7 +353,10 @@ impl Normalizer for NoopNormalizer {
     fn provider_name(&self) -> &'static str {
         "mock"
     }
-    fn normalize_user(&self, _raw: &serde_json::Value) -> std::result::Result<User, NormalizeError> {
+    fn normalize_user(
+        &self,
+        _raw: &serde_json::Value,
+    ) -> std::result::Result<User, NormalizeError> {
         unimplemented!()
     }
     fn normalize_post(
@@ -473,10 +474,11 @@ async fn ingest_thread_persists_root_and_descendants() {
     let root = MockProvider::make_post("root_with_kids", "author");
     let reply_a = MockProvider::make_post("reply_a", "other");
     let reply_b = MockProvider::make_post("reply_b", "other");
-    let provider = Arc::new(
-        MockProvider::new(vec![])
-            .with_thread(vec![root.clone(), reply_a.clone(), reply_b.clone()]),
-    );
+    let provider = Arc::new(MockProvider::new(vec![]).with_thread(vec![
+        root.clone(),
+        reply_a.clone(),
+        reply_b.clone(),
+    ]));
     let store = MockStore::new();
     let ingestor = Ingestor::new(provider, Box::new(NoopNormalizer), Arc::clone(&store));
 
@@ -537,11 +539,10 @@ async fn engagement_collects_direct_replies_to_my_posts() {
     let reply_a = post("ra", "stranger1");
     let reply_b = post("rb", "stranger2");
 
-    let provider = Arc::new(
-        MockProvider::new(vec![])
-            .with_me(me.clone())
-            .with_reply_to(&PostId::new("my_post"), vec![reply_a.clone(), reply_b.clone()]),
-    );
+    let provider = Arc::new(MockProvider::new(vec![]).with_me(me.clone()).with_reply_to(
+        &PostId::new("my_post"),
+        vec![reply_a.clone(), reply_b.clone()],
+    ));
     let store = MockStore::new();
     // Pre-seed the store: engagement uses posts_by_author to find seeds.
     store
@@ -549,7 +550,10 @@ async fn engagement_collects_direct_replies_to_my_posts() {
         .unwrap();
 
     let ingestor = Ingestor::new(provider, Box::new(NoopNormalizer), Arc::clone(&store));
-    let run = ingestor.ingest_engagement(8).await.expect("engagement failed");
+    let run = ingestor
+        .ingest_engagement(8)
+        .await
+        .expect("engagement failed");
 
     // 2 new replies stored (my_post was already there and is just the seed).
     assert_eq!(run.posts_fetched, 2);
@@ -567,7 +571,13 @@ async fn engagement_recurses_into_replies_to_replies() {
     //       └── rb (stranger)
     //           └── rc (stranger)    <- only collected if BFS keeps going
     let me_id = UserId::new("me");
-    let me = User { id: me_id.clone(), username: Some("me".into()), name: None, biography: None, profile_picture_url: None };
+    let me = User {
+        id: me_id.clone(),
+        username: Some("me".into()),
+        name: None,
+        biography: None,
+        profile_picture_url: None,
+    };
     let my_post = post("my_post", "me");
     let ra = post("ra", "stranger");
     let rb = post("rb", "stranger");
@@ -583,7 +593,10 @@ async fn engagement_recurses_into_replies_to_replies() {
     let store = MockStore::new();
     store.upsert_posts(&[my_post], None).unwrap();
     let ingestor = Ingestor::new(provider, Box::new(NoopNormalizer), Arc::clone(&store));
-    let run = ingestor.ingest_engagement(8).await.expect("engagement failed");
+    let run = ingestor
+        .ingest_engagement(8)
+        .await
+        .expect("engagement failed");
 
     assert_eq!(run.posts_fetched, 3, "3 descendants across 3 BFS levels");
     let state = store.state.lock().unwrap();
@@ -599,7 +612,13 @@ async fn engagement_respects_depth_cap() {
     // (ra is at depth 0 relative to my_post seed; rb would be depth 1; rc
     // depth 2).
     let me_id = UserId::new("me");
-    let me = User { id: me_id.clone(), username: Some("me".into()), name: None, biography: None, profile_picture_url: None };
+    let me = User {
+        id: me_id.clone(),
+        username: Some("me".into()),
+        name: None,
+        biography: None,
+        profile_picture_url: None,
+    };
     let my_post = post("my_post", "me");
 
     let provider = Arc::new(
@@ -613,7 +632,10 @@ async fn engagement_respects_depth_cap() {
     store.upsert_posts(&[my_post], None).unwrap();
     let ingestor = Ingestor::new(provider, Box::new(NoopNormalizer), Arc::clone(&store));
     // depth=1: only descend from seed, not from replies.
-    let run = ingestor.ingest_engagement(1).await.expect("engagement failed");
+    let run = ingestor
+        .ingest_engagement(1)
+        .await
+        .expect("engagement failed");
 
     // Only `ra` collected (direct reply). `rb` and `rc` are past the cap.
     assert_eq!(run.posts_fetched, 1);
@@ -629,7 +651,13 @@ async fn engagement_deduplicates_across_seeds_and_levels() {
     // Two seeds that both eventually hit the same reply id — it should
     // only be fetched/stored once.
     let me_id = UserId::new("me");
-    let me = User { id: me_id.clone(), username: Some("me".into()), name: None, biography: None, profile_picture_url: None };
+    let me = User {
+        id: me_id.clone(),
+        username: Some("me".into()),
+        name: None,
+        biography: None,
+        profile_picture_url: None,
+    };
     let seed_a = post("seed_a", "me");
     let seed_b = post("seed_b", "me");
     let shared = post("shared", "stranger");
@@ -641,11 +669,12 @@ async fn engagement_deduplicates_across_seeds_and_levels() {
             .with_reply_to(&PostId::new("seed_b"), vec![shared.clone()]),
     );
     let store = MockStore::new();
-    store
-        .upsert_posts(&[seed_a, seed_b], None)
-        .unwrap();
+    store.upsert_posts(&[seed_a, seed_b], None).unwrap();
     let ingestor = Ingestor::new(provider, Box::new(NoopNormalizer), Arc::clone(&store));
-    let run = ingestor.ingest_engagement(8).await.expect("engagement failed");
+    let run = ingestor
+        .ingest_engagement(8)
+        .await
+        .expect("engagement failed");
 
     // `shared` only counts once.
     assert_eq!(run.posts_fetched, 1);

@@ -69,6 +69,11 @@ pub enum Command {
 
     /// Export records from the store.
     Export(ExportArgs),
+
+    /// Delete posts or replies on Threads (remote, irreversible).
+    /// Default is DRY-RUN; pass --apply to actually delete.
+    #[command(subcommand)]
+    Delete(DeleteCommand),
 }
 
 #[derive(Debug, clap::Args)]
@@ -132,6 +137,40 @@ pub struct ExportArgs {
     /// Write to a file instead of stdout.
     #[arg(long)]
     pub out: Option<PathBuf>,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum DeleteCommand {
+    /// Delete top-level posts authored by you.
+    Posts(DeleteArgs),
+    /// Delete replies authored by you.
+    Replies(DeleteArgs),
+}
+
+#[derive(Debug, clap::Args)]
+pub struct DeleteArgs {
+    /// Only consider posts created STRICTLY BEFORE this time (RFC 3339 or YYYY-MM-DD).
+    #[arg(long)]
+    pub before: Option<String>,
+
+    /// Only consider posts created AT OR AFTER this time (RFC 3339 or YYYY-MM-DD).
+    #[arg(long)]
+    pub after: Option<String>,
+
+    /// Cap the number of candidates considered. Defaults to no cap, but the
+    /// 100/24h rate limit always applies on --apply.
+    #[arg(long)]
+    pub limit: Option<usize>,
+
+    /// Actually perform the delete. Without this flag, prints what WOULD
+    /// be deleted and changes nothing.
+    #[arg(long)]
+    pub apply: bool,
+
+    /// Skip the "this endpoint is undocumented for replies" warning prompt.
+    /// Only relevant for `delete replies`.
+    #[arg(long)]
+    pub yes_undocumented: bool,
 }
 
 #[cfg(test)]

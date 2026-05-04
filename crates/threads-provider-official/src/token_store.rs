@@ -12,14 +12,25 @@ pub struct Token {
     pub access_token: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_in: Option<i64>,
+    /// Meta's token-exchange endpoint does not return the granted scopes; we
+    /// record what we requested at login time. This is a heuristic, not a
+    /// guarantee — if a request fails with 403/insufficient_scope, re-run
+    /// `auth login`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub granted_scopes: Option<Vec<String>>,
     pub issued_at: DateTime<Utc>,
 }
 
 impl Token {
-    pub fn new(access_token: impl Into<String>, expires_in: Option<i64>) -> Self {
+    pub fn new(
+        access_token: impl Into<String>,
+        expires_in: Option<i64>,
+        granted_scopes: Option<Vec<String>>,
+    ) -> Self {
         Self {
             access_token: access_token.into(),
             expires_in,
+            granted_scopes,
             issued_at: Utc::now(),
         }
     }
@@ -27,12 +38,30 @@ impl Token {
     pub fn is_expired(&self) -> bool {
         match self.expires_in {
             Some(secs) if secs > 0 => {
-                let elapsed = Utc::now().signed_duration_since(self.issued_at).num_seconds();
+                let elapsed = Utc::now()
+                    .signed_duration_since(self.issued_at)
+                    .num_seconds();
                 elapsed >= secs
             }
             _ => false,
         }
     }
+}
+
+/// Strict scope check: returns `true` ONLY when the token records a
+/// `granted_scopes` list and that list contains `scope`.
+///
+/// Tokens minted before scope-tracking shipped (`granted_scopes = None`) are
+/// treated as missing the scope. This is intentionally strict for write
+/// operations like `threads_delete` — those scopes were added in the same
+/// release as scope tracking, so a `None` token by definition does not have
+/// them. Pre-existing read-only behavior continues to work because read
+/// endpoints don't call this helper.
+pub fn token_has_scope(token: &Token, scope: &str) -> bool {
+    token
+        .granted_scopes
+        .as_ref()
+        .is_some_and(|scopes| scopes.iter().any(|s| s == scope))
 }
 
 /// Persists an access [`Token`] across runs.
@@ -207,20 +236,49 @@ mod tests {
     fn roundtrip_via_file_fallback() {
         let tmp = TempDir::new().unwrap();
         let store = TokenStore::new().with_fallback_path(tmp.path().join("token.json"));
-        let t = Token::new("abcd", Some(3600));
+        let t = Token::new("abcd", Some(3600), Some(vec!["threads_basic".into()]));
         store.save(&t).unwrap();
         let loaded = store.load().unwrap().expect("token should load");
         assert_eq!(loaded.access_token, "abcd");
+        assert_eq!(
+            loaded.granted_scopes.as_deref(),
+            Some(&["threads_basic".to_string()][..])
+        );
         store.clear().unwrap();
     }
 
     #[test]
     fn expiry_detection() {
-        let mut t = Token::new("x", Some(1));
+        let mut t = Token::new("x", Some(1), None);
         t.issued_at = Utc::now() - chrono::Duration::seconds(10);
         assert!(t.is_expired());
-        let t2 = Token::new("y", Some(3600));
+        let t2 = Token::new("y", Some(3600), None);
         assert!(!t2.is_expired());
+    }
+
+    #[test]
+    fn legacy_token_without_scopes_lacks_new_scopes() {
+        // A token saved before scope tracking shipped has `granted_scopes = None`.
+        // For new write scopes like `threads_delete`, that MUST read as missing
+        // so the CLI can guide the user to re-run `auth login`.
+        let t: Token =
+            serde_json::from_str(r#"{"access_token":"t","issued_at":"2026-01-01T00:00:00Z"}"#)
+                .unwrap();
+
+        assert!(t.granted_scopes.is_none());
+        assert!(!token_has_scope(&t, "threads_delete"));
+    }
+
+    #[test]
+    fn token_has_scope_checks_recorded_scopes() {
+        let t = Token::new(
+            "t",
+            None,
+            Some(vec!["threads_basic".into(), "threads_delete".into()]),
+        );
+
+        assert!(token_has_scope(&t, "threads_delete"));
+        assert!(!token_has_scope(&t, "threads_publish"));
     }
 
     #[cfg(unix)]
@@ -237,13 +295,23 @@ mod tests {
         // would fail — but keyring may still succeed on dev machines. To
         // guarantee the file write path runs, call the helpers directly.
         create_private_dir(&dir).unwrap();
-        write_private_file(&file, b"{\"access_token\":\"t\",\"issued_at\":\"2026-01-01T00:00:00Z\"}").unwrap();
+        write_private_file(
+            &file,
+            b"{\"access_token\":\"t\",\"issued_at\":\"2026-01-01T00:00:00Z\"}",
+        )
+        .unwrap();
 
         let dir_mode = fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
-        assert_eq!(dir_mode, 0o700, "parent dir should be 0700, got {dir_mode:o}");
+        assert_eq!(
+            dir_mode, 0o700,
+            "parent dir should be 0700, got {dir_mode:o}"
+        );
 
         let file_mode = fs::metadata(&file).unwrap().permissions().mode() & 0o777;
-        assert_eq!(file_mode, 0o600, "token file should be 0600, got {file_mode:o}");
+        assert_eq!(
+            file_mode, 0o600,
+            "token file should be 0600, got {file_mode:o}"
+        );
 
         // Keep the store struct alive so `with_fallback_path` isn't dead-code.
         let _ = store;
@@ -264,7 +332,10 @@ mod tests {
         create_private_dir(&dir).unwrap();
 
         let mode = fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o700, "loose dir should have been tightened to 0700, got {mode:o}");
+        assert_eq!(
+            mode, 0o700,
+            "loose dir should have been tightened to 0700, got {mode:o}"
+        );
     }
 
     #[cfg(unix)]
@@ -282,6 +353,9 @@ mod tests {
         write_private_file(&file, b"{}").unwrap();
 
         let mode = fs::metadata(&file).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600, "loose file should have been tightened to 0600, got {mode:o}");
+        assert_eq!(
+            mode, 0o600,
+            "loose file should have been tightened to 0600, got {mode:o}"
+        );
     }
 }

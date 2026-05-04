@@ -2,10 +2,13 @@
 #[allow(clippy::module_inception)]
 mod tests {
     use chrono::Utc;
+    use rusqlite::params;
     use serde_json::json;
-    use threads_core::model::{FetchRun, Media, MediaKind, Mention, Post, PostId, UrlEntity, User, UserId};
+    use threads_core::model::{
+        FetchRun, Media, MediaKind, Mention, Post, PostId, UrlEntity, User, UserId,
+    };
 
-    use crate::Store;
+    use crate::{PostKind, Store};
 
     fn make_user(id: &str) -> User {
         User {
@@ -34,6 +37,17 @@ mod tests {
         }
     }
 
+    fn count_rows(store: &Store, table: &str, post_id: &str) -> i64 {
+        let conn = store.raw_conn();
+        let sql = format!("SELECT COUNT(*) FROM {table} WHERE post_id = ?1");
+        conn.query_row(&sql, params![post_id], |row| row.get::<_, i64>(0))
+            .unwrap()
+    }
+
+    fn ids(posts: &[Post]) -> Vec<&str> {
+        posts.iter().map(|p| p.id.as_str()).collect()
+    }
+
     // ------------------------------------------------------------------ //
     //  Migrations idempotency                                             //
     // ------------------------------------------------------------------ //
@@ -53,6 +67,32 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         run_migrations(&conn).unwrap();
         run_migrations(&conn).unwrap(); // second call must be a no-op
+    }
+
+    #[test]
+    fn migration_v3_creates_deletions_table() {
+        let store = Store::open_in_memory().unwrap();
+        let conn = store.raw_conn();
+
+        let table_name: String = conn
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'deletions'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(table_name, "deletions");
+
+        let index_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'index'
+                   AND name IN ('deletions_deleted_at_idx', 'deletions_post_idx')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(index_count, 2);
     }
 
     // ------------------------------------------------------------------ //
@@ -87,7 +127,10 @@ mod tests {
 
         let fetched = store.get_post(&PostId::new("p42")).unwrap();
         assert!(fetched.is_some());
-        assert_eq!(fetched.unwrap().text.as_deref(), Some("hello from post p42"));
+        assert_eq!(
+            fetched.unwrap().text.as_deref(),
+            Some("hello from post p42")
+        );
     }
 
     // ------------------------------------------------------------------ //
@@ -338,7 +381,9 @@ mod tests {
     fn upsert_posts_batch_returns_count() {
         let store = Store::open_in_memory().unwrap();
 
-        let posts: Vec<Post> = (0..5).map(|i| make_post(&format!("bp{i}"), "batch_author")).collect();
+        let posts: Vec<Post> = (0..5)
+            .map(|i| make_post(&format!("bp{i}"), "batch_author"))
+            .collect();
         let n = store.upsert_posts(&posts, Some("run-batch")).unwrap();
         assert_eq!(n, 5);
 
@@ -375,7 +420,10 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         let result = store.record_fetch_run_end("nonexistent", Utc::now(), 0, None);
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), crate::StoreError::NotFound(_)));
+        assert!(matches!(
+            result.unwrap_err(),
+            crate::StoreError::NotFound(_)
+        ));
     }
 
     // ------------------------------------------------------------------ //
@@ -421,6 +469,253 @@ mod tests {
         assert_eq!(fetched.media.len(), 2);
         assert_eq!(fetched.urls.len(), 1);
         assert_eq!(fetched.urls[0].url, "https://threads.net");
+    }
+
+    // ------------------------------------------------------------------ //
+    //  Deletions                                                          //
+    // ------------------------------------------------------------------ //
+
+    #[test]
+    fn posts_in_window_filters_author_time_and_kind() {
+        let store = Store::open_in_memory().unwrap();
+        let base = Utc::now();
+
+        let mut before_window = make_post("before_window", "me");
+        before_window.created_at = Some(base - chrono::Duration::hours(2));
+        store.upsert_post(&before_window, None).unwrap();
+
+        let mut root = make_post("root_in_window", "me");
+        root.created_at = Some(base);
+        store.upsert_post(&root, None).unwrap();
+
+        let mut reply = make_post("reply_in_window", "me");
+        reply.created_at = Some(base + chrono::Duration::minutes(1));
+        reply.parent_id = Some(PostId::new("root_in_window"));
+        reply.root_id = Some(PostId::new("root_in_window"));
+        store.upsert_post(&reply, None).unwrap();
+
+        let mut other_author = make_post("other_author", "someone_else");
+        other_author.created_at = Some(base + chrono::Duration::minutes(2));
+        store.upsert_post(&other_author, None).unwrap();
+
+        let mut at_before_bound = make_post("at_before_bound", "me");
+        at_before_bound.created_at = Some(base + chrono::Duration::hours(1));
+        store.upsert_post(&at_before_bound, None).unwrap();
+
+        let mut null_created = make_post("null_created", "me");
+        null_created.created_at = None;
+        store.upsert_post(&null_created, None).unwrap();
+
+        let after = base - chrono::Duration::minutes(30);
+        let before = base + chrono::Duration::hours(1);
+
+        let posts = store
+            .posts_in_window(
+                &UserId::new("me"),
+                Some(after),
+                Some(before),
+                PostKind::Post,
+                10,
+            )
+            .unwrap();
+        assert_eq!(ids(&posts), vec!["root_in_window"]);
+
+        let replies = store
+            .posts_in_window(
+                &UserId::new("me"),
+                Some(after),
+                Some(before),
+                PostKind::Reply,
+                10,
+            )
+            .unwrap();
+        assert_eq!(ids(&replies), vec!["reply_in_window"]);
+    }
+
+    #[test]
+    fn delete_post_is_idempotent_and_cascades_child_tables() {
+        let store = Store::open_in_memory().unwrap();
+
+        let run = FetchRun {
+            id: "run-delete".into(),
+            provider: "official".into(),
+            started_at: Utc::now(),
+            finished_at: None,
+            posts_fetched: 0,
+            error: None,
+        };
+        store.record_fetch_run_start(&run).unwrap();
+
+        let mut post = make_post("delete_me", "delete_author");
+        post.media = vec![Media {
+            kind: MediaKind::Image,
+            url: Some("https://example.com/delete.jpg".into()),
+            thumbnail_url: None,
+        }];
+        post.urls = vec![UrlEntity {
+            url: "https://example.com".into(),
+            display_text: Some("example".into()),
+        }];
+        post.mentions = vec![Mention {
+            username: "mentioned".into(),
+            user_id: None,
+        }];
+        post.raw = Some(json!({ "id": "delete_me" }));
+        store.upsert_post(&post, Some("run-delete")).unwrap();
+
+        assert_eq!(count_rows(&store, "media", "delete_me"), 1);
+        assert_eq!(count_rows(&store, "urls", "delete_me"), 1);
+        assert_eq!(count_rows(&store, "mentions", "delete_me"), 1);
+        assert_eq!(count_rows(&store, "raw_payloads", "delete_me"), 1);
+
+        assert!(store.delete_post(&PostId::new("delete_me")).unwrap());
+        assert!(!store.delete_post(&PostId::new("delete_me")).unwrap());
+        assert!(store.get_post(&PostId::new("delete_me")).unwrap().is_none());
+
+        assert_eq!(count_rows(&store, "media", "delete_me"), 0);
+        assert_eq!(count_rows(&store, "urls", "delete_me"), 0);
+        assert_eq!(count_rows(&store, "mentions", "delete_me"), 0);
+        assert_eq!(count_rows(&store, "raw_payloads", "delete_me"), 0);
+    }
+
+    #[test]
+    fn delete_post_clears_edges_in_both_directions() {
+        // `edges` has no FK to `posts`, so DELETE FROM posts cannot CASCADE to it.
+        // `delete_post` must explicitly clear edges where the deleted post is
+        // either endpoint, otherwise stale rows orphan the recursive thread CTE.
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_user(&make_user("parent_user")).unwrap();
+        store.upsert_user(&make_user("root_user")).unwrap();
+        store.upsert_user(&make_user("mention_user")).unwrap();
+
+        // Post P references three other posts/users (3 edges with from_id = P).
+        let mut p = make_post("P", "author");
+        p.parent_id = Some(PostId::new("parent_user"));
+        p.root_id = Some(PostId::new("root_user"));
+        p.mentions = vec![Mention {
+            username: "u".into(),
+            user_id: Some(UserId::new("mention_user")),
+        }];
+        store.upsert_post(&p, None).unwrap();
+
+        // Post C is a reply to P (1 edge with to_id = P).
+        let mut c = make_post("C", "other_author");
+        c.parent_id = Some(PostId::new("P"));
+        store.upsert_post(&c, None).unwrap();
+
+        assert_eq!(
+            count_edges_from(&store, "P"),
+            3,
+            "P should own 3 outbound edges"
+        );
+        let inbound_to_p: i64 = {
+            let conn = store.raw_conn();
+            conn.query_row(
+                "SELECT COUNT(*) FROM edges WHERE to_id = ?1",
+                params!["P"],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(inbound_to_p, 1, "C's reply edge should target P");
+
+        // Delete P. Both directions of edges referencing P must vanish.
+        assert!(store.delete_post(&PostId::new("P")).unwrap());
+        assert_eq!(
+            count_edges_from(&store, "P"),
+            0,
+            "outbound edges from P should be gone"
+        );
+        let inbound_to_p_after: i64 = {
+            let conn = store.raw_conn();
+            conn.query_row(
+                "SELECT COUNT(*) FROM edges WHERE to_id = ?1",
+                params!["P"],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            inbound_to_p_after, 0,
+            "inbound edges pointing at P should be gone"
+        );
+
+        // C itself should still exist (we only deleted P).
+        assert!(store.get_post(&PostId::new("C")).unwrap().is_some());
+    }
+
+    #[test]
+    fn deletions_in_last_24h_slides_window() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .record_deletion(&PostId::new("recent_success"), PostKind::Post, true, None)
+            .unwrap();
+        store
+            .record_deletion(
+                &PostId::new("recent_failure"),
+                PostKind::Reply,
+                false,
+                Some("not found"),
+            )
+            .unwrap();
+
+        let old = (Utc::now() - chrono::Duration::hours(25)).to_rfc3339();
+        let conn = store.raw_conn();
+        conn.execute(
+            "INSERT INTO deletions (post_id, kind, deleted_at, success, error)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params!["old_success", "post", old, 1, Option::<&str>::None],
+        )
+        .unwrap();
+        drop(conn);
+
+        assert_eq!(store.deletions_in_last_24h().unwrap(), 1);
+    }
+
+    #[test]
+    fn oldest_deletion_in_last_24h_returns_min_within_window() {
+        let store = Store::open_in_memory().unwrap();
+        // None on empty.
+        assert!(store.oldest_deletion_in_last_24h().unwrap().is_none());
+
+        // Insert one deletion 5h ago, one 1h ago. Helper should return the older one.
+        let conn = store.raw_conn();
+        let five_hours_ago = (Utc::now() - chrono::Duration::hours(5)).to_rfc3339();
+        let one_hour_ago = (Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+        conn.execute(
+            "INSERT INTO deletions (post_id, kind, deleted_at, success, error)
+             VALUES (?1, 'post', ?2, 1, NULL)",
+            params!["old_recent", &five_hours_ago],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO deletions (post_id, kind, deleted_at, success, error)
+             VALUES (?1, 'post', ?2, 1, NULL)",
+            params!["newer", &one_hour_ago],
+        )
+        .unwrap();
+        // A failed deletion 2h ago must NOT be returned (only successes count).
+        let two_hours_ago = (Utc::now() - chrono::Duration::hours(2)).to_rfc3339();
+        conn.execute(
+            "INSERT INTO deletions (post_id, kind, deleted_at, success, error)
+             VALUES (?1, 'post', ?2, 0, 'boom')",
+            params!["failed", &two_hours_ago],
+        )
+        .unwrap();
+        // A successful deletion 25h ago is OUTSIDE the window.
+        let twenty_five_hours_ago = (Utc::now() - chrono::Duration::hours(25)).to_rfc3339();
+        conn.execute(
+            "INSERT INTO deletions (post_id, kind, deleted_at, success, error)
+             VALUES (?1, 'post', ?2, 1, NULL)",
+            params!["too_old", &twenty_five_hours_ago],
+        )
+        .unwrap();
+        drop(conn);
+
+        let oldest = store.oldest_deletion_in_last_24h().unwrap().expect("some");
+        let oldest_str = oldest.to_rfc3339();
+        // Should equal the 5h-ago row, not the 1h-ago, not the failed, not the 25h-ago.
+        assert_eq!(oldest_str, five_hours_ago);
     }
 
     // ------------------------------------------------------------------ //

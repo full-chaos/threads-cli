@@ -30,6 +30,12 @@ pub enum Error {
     #[error("not found: {0}")]
     NotFound(String),
 
+    /// The provider does not support this operation (e.g. `web` provider
+    /// asked to delete). Distinct from network/auth/parse errors so callers
+    /// can route to a clear "your provider can't do that" message.
+    #[error("operation not supported by this provider: {0}")]
+    NotSupported(String),
+
     #[error("{0}")]
     Other(String),
 }
@@ -58,17 +64,32 @@ mod tests {
 
     #[test]
     fn display_forms_are_human_readable() {
-        assert_eq!(Error::Auth("bad token".into()).to_string(), "authentication error: bad token");
         assert_eq!(
-            Error::RateLimit { retry_after: Some(Duration::from_secs(30)) }.to_string(),
+            Error::Auth("bad token".into()).to_string(),
+            "authentication error: bad token"
+        );
+        assert_eq!(
+            Error::RateLimit {
+                retry_after: Some(Duration::from_secs(30))
+            }
+            .to_string(),
             "rate limited; retry after Some(30s)"
         );
-        assert_eq!(Error::NotFound("post".into()).to_string(), "not found: post");
+        assert_eq!(
+            Error::NotFound("post".into()).to_string(),
+            "not found: post"
+        );
+        assert_eq!(
+            Error::NotSupported("delete_post".into()).to_string(),
+            "operation not supported by this provider: delete_post"
+        );
     }
 
     #[test]
     fn serde_json_error_maps_to_parse() {
-        let err: Error = serde_json::from_str::<u32>("notanumber").unwrap_err().into();
+        let err: Error = serde_json::from_str::<u32>("notanumber")
+            .unwrap_err()
+            .into();
         assert!(matches!(err, Error::Parse(_)));
     }
 
