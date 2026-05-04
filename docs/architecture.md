@@ -97,6 +97,55 @@ ingest me → orchestrator {
 }
 ```
 
+## Data flow (delete — destructive remote)
+
+Delete is the only write path in v1. Driven by `threads-cli delete posts` /
+`delete replies`; full design at [`docs/plans/delete.md`](plans/delete.md).
+
+```
+delete posts --before X --after Y [--apply] [--limit N]
+    1. parse_time(--before, --after)              → DateTime<Utc>
+    2. validate token has `threads_delete` scope  → token_has_scope (strict)
+    3. fetch_me()                                  → me.id
+    4. store.posts_in_window(me.id, after, before, kind, limit)
+    5. print DRY RUN summary; --apply ? continue : return
+    6. (replies) interactive `undocumented endpoint` confirmation
+    7. pre-flight rate-limit check
+         a. store.deletions_in_last_24h() < 100
+         b. else bail with `quota resets at <oldest + 24h>`
+    8. for each id in window:
+         a. provider.delete_post(id) → DELETE /v1.0/{id}
+         b. on Ok:    store.delete_post(id) (tx: edges + posts)
+                      store.record_deletion(id, kind, ok=true)
+         c. on Err:   store.record_deletion(id, kind, ok=false, err=...)
+         d. on Error::RateLimit: stop batch cleanly
+    9. print summary: deleted, failed, remaining_quota_24h
+```
+
+Key invariants:
+
+- **Dry-run is the default.** `--apply` is required to actually delete.
+- **Local store is the candidate source of truth.** `delete` does not
+  enumerate from the API; the user runs `ingest me` first to refresh.
+- **`deletions` audit table** records every attempt (success or failure)
+  so the 100/24h rate limit gate is auditable across processes.
+- **`edges` cleanup is manual** — the table has no FK to `posts`, so
+  `store.delete_post` opens a transaction that removes both directions of
+  edges referencing the deleted id before deleting the post row itself.
+- **`archive` is intentionally absent.** Meta exposes no remote archive
+  endpoint for root posts; the `ingest` command serves the local-archive
+  role.
+
+## Manifest action types
+
+- `[[objects]]` — single-resource GET (e.g. `/me`, `/{post-id}`)
+- `[[edges]]` — paginated GET (e.g. `/me/threads`, `/{post-id}/replies`)
+- `[[actions]]` — write operations (`DELETE /{post-id}`, etc.)
+
+Adding a new action is a manifest edit + a `Provider` trait method with a
+default `Err(Error::NotSupported)` impl + an override on `OfficialProvider`.
+The experimental `web` provider stays read-only by inheriting the default.
+
 ## SQLite strategy
 
 - Single DB file at `~/.local/share/threads-cli/store.db`.
