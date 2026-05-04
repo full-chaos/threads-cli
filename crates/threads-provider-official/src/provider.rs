@@ -57,8 +57,19 @@ impl OfficialProvider {
             .map(|e| e.path.clone())
     }
 
+    fn action_path(&self, key: &str) -> Option<String> {
+        self.manifest
+            .actions
+            .iter()
+            .find(|a| a.name == key)
+            .map(|a| a.path.clone())
+    }
+
     fn substitute_post_id(path: &str, post_id: &PostId) -> String {
+        // Delete actions use either `{post-id}` or `{reply-id}` for the same
+        // media-object id slot, so one helper substitutes both placeholders.
         path.replace("{post-id}", post_id.as_str())
+            .replace("{reply-id}", post_id.as_str())
     }
 }
 
@@ -172,6 +183,25 @@ impl Provider for OfficialProvider {
             }
         }
         Ok(out)
+    }
+
+    async fn delete_post(&self, post_id: &PostId) -> Result<()> {
+        let path = self
+            .action_path("post/delete")
+            .ok_or_else(|| Error::Manifest("missing action `post/delete`".into()))?;
+        let path = Self::substitute_post_id(&path, post_id);
+        // Threads API may return {"success": true} or just 200; we don't care.
+        let _ = self.http.delete_json(&path, &[]).await?;
+        Ok(())
+    }
+
+    async fn delete_reply(&self, reply_id: &PostId) -> Result<()> {
+        let path = self
+            .action_path("reply/delete")
+            .ok_or_else(|| Error::Manifest("missing action `reply/delete`".into()))?;
+        let path = Self::substitute_post_id(&path, reply_id);
+        let _ = self.http.delete_json(&path, &[]).await?;
+        Ok(())
     }
 }
 
