@@ -113,8 +113,8 @@ ingest me / thread / engagement (existing)
         │  normalized Post (sparse for reply edges)
         ▼
 threads-store::upsert_post_tx
-  load_post(existing) ─► Post::merge(existing, incoming) ─► write merged row
-                                                          └► reconcile edges/children
+  @-sentinel author ─► load_post ─► Post::merge ─► write merged row + reconcile children
+  real (numeric) author ─► overwrite (trust the full fetch; allows clearing fields)
   + author resolution: rewrite @handle → real id when (username→id) is known
 ```
 
@@ -143,9 +143,14 @@ Merge rules:
 | `id`, `raw` | `incoming` |
 
 **`crates/threads-store/src/query.rs`** — `upsert_post_tx`:
-- Before writing, `load_post(&tx, id)`; if `Some`, compute `Post::merge(existing, incoming)`
+- Before writing, **and only when the incoming author is the `@username` sentinel** (i.e. a
+  sparse reply-edge fetch), `load_post(&tx, id)`; if `Some`, compute `Post::merge(existing, incoming)`
   and use the merged value for the row write, child-table rebuild, and edge reconciliation.
-- Keep the existing delete-then-reinsert of children/edges, but drive it from the merged post.
+- For a real (non-`@`) author — a full fetch — skip the merge and keep the prior overwrite, so
+  intentional corrections (e.g. clearing `parent_id`) still propagate. This reconciles the
+  merge's field-preservation rules with the existing `reupsert_without_parent_drops_stale_edges`
+  behavior; the `@` sentinel is the signal that the fetch is structurally incomplete.
+- Keep the existing delete-then-reinsert of children/edges, but drive it from the resulting post.
 
 **Author resolution** (`threads-provider-official` + `threads-store` + `threads-ingest`):
 - *Current state:* the live author synthesis is in `provider::dto_to_post`, which uses a
@@ -162,8 +167,9 @@ Merge rules:
   `ingest_engagement` (currently `me` is fetched then discarded except `.id`).
 - `threads-store`: add `resolve_author(username, real_id)` that, in one txn, upserts the
   real user, runs `UPDATE posts SET author_id = real_id WHERE author_id = '@' || username`,
-  rewrites owned edges whose `from_id` was the sentinel, and deletes the `@username`
-  placeholder user row.
+  then deletes the `@username` placeholder user row (posts are re-keyed before the delete so
+  the `ON DELETE CASCADE` is a no-op). `edges` are intentionally NOT touched — `edges.from_id`
+  holds post ids, never an author handle, so an author rewrite has nothing to reconcile there.
 - Trigger resolution whenever a `(username, real_id)` pair is observed (from `/me`, or any
   post DTO carrying both `owner.id` and `username`).
 - The store is pre-1.0 and re-ingestable, so any rows written under the old bare-username
