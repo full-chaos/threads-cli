@@ -291,6 +291,7 @@ struct MockStoreState {
     run_started: Vec<FetchRun>,
     run_ended: Vec<(String, u64, Option<String>)>,
     upserted_users: Vec<User>,
+    resolve_author_calls: Vec<(String, UserId)>,
 }
 
 struct MockStore {
@@ -348,6 +349,12 @@ impl StoreWrite for MockStore {
     fn upsert_user(&self, user: &User) -> Result<()> {
         let mut s = self.state.lock().unwrap();
         s.upserted_users.push(user.clone());
+        Ok(())
+    }
+
+    fn resolve_author(&self, username: &str, real_id: &UserId) -> Result<()> {
+        let mut s = self.state.lock().unwrap();
+        s.resolve_author_calls.push((username.to_string(), real_id.clone()));
         Ok(())
     }
 }
@@ -748,4 +755,22 @@ async fn ingest_me_upserts_me_profile() {
     let state = store.state.lock().unwrap();
     assert!(state.upserted_users.iter().any(|u| u.id == UserId::new("real_id_99")),
         "me profile must be upserted during ingest_me");
+}
+
+#[tokio::test]
+async fn resolve_author_called_with_correct_args() {
+    let me = User {
+        id: UserId::new("real_77"),
+        username: Some("carol".into()),
+        name: None, biography: None, profile_picture_url: None,
+    };
+    let provider = Arc::new(MockProvider::new(vec![vec![]]).with_me(me.clone()));
+    let store = MockStore::new();
+    let ingestor = Ingestor::new(provider, Box::new(NoopNormalizer), Arc::clone(&store));
+    ingestor.ingest_me().await.expect("ingest_me failed");
+    let state = store.state.lock().unwrap();
+    assert!(
+        state.resolve_author_calls.iter().any(|(u, id)| u == "carol" && *id == UserId::new("real_77")),
+        "resolve_author must be called with (\"carol\", UserId(\"real_77\"))"
+    );
 }

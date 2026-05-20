@@ -759,6 +759,46 @@ fn _edge_kind_from_str(s: &str) -> Option<EdgeKind> {
 }
 
 // ------------------------------------------------------------------ //
+//  Author resolution                                                  //
+// ------------------------------------------------------------------ //
+
+/// Resolve a synthesized `@username` placeholder author to a real numeric id.
+/// In one transaction: upsert the real user, rewrite `posts.author_id` from
+/// `'@' || username` to `real_id`, then delete the placeholder user row.
+/// Idempotent.
+pub fn resolve_author(conn: &mut Connection, username: &str, real_id: &UserId) -> Result<()> {
+    let placeholder = format!("@{username}");
+    let now = Utc::now().to_rfc3339();
+    let tx = conn.transaction().map_err(StoreError::Sqlite)?;
+
+    // 1. Upsert the real user stub (preserves any existing richer row).
+    tx.execute(
+        "INSERT INTO users (id, username, name, biography, profile_picture_url, updated_at)
+         VALUES (?1, ?2, NULL, NULL, NULL, ?3)
+         ON CONFLICT(id) DO UPDATE SET
+             username   = COALESCE(excluded.username, users.username),
+             updated_at = excluded.updated_at",
+        params![real_id.as_str(), username, now],
+    )
+    .map_err(StoreError::Sqlite)?;
+
+    // 2. Rewrite posts authored under the placeholder (must precede the DELETE
+    //    so the FK cascade finds no rows still pointing at the placeholder).
+    tx.execute(
+        "UPDATE posts SET author_id = ?1 WHERE author_id = ?2",
+        params![real_id.as_str(), &placeholder],
+    )
+    .map_err(StoreError::Sqlite)?;
+
+    // 3. Remove the now-orphaned placeholder user row.
+    tx.execute("DELETE FROM users WHERE id = ?1", params![&placeholder])
+        .map_err(StoreError::Sqlite)?;
+
+    tx.commit().map_err(StoreError::Sqlite)?;
+    Ok(())
+}
+
+// ------------------------------------------------------------------ //
 //  Test-only probes                                                   //
 // ------------------------------------------------------------------ //
 

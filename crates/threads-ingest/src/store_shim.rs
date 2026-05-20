@@ -38,6 +38,10 @@ pub trait StoreWrite: Send + Sync {
 
     /// Upsert the authenticated user's profile row.
     fn upsert_user(&self, user: &User) -> Result<()>;
+
+    /// Resolve all posts stored under `'@' || username` to `real_id`, upsert
+    /// the real user, and delete the placeholder user row.
+    fn resolve_author(&self, username: &str, real_id: &UserId) -> Result<()>;
 }
 
 impl StoreWrite for threads_store::Store {
@@ -69,5 +73,9 @@ impl StoreWrite for threads_store::Store {
 
     fn upsert_user(&self, user: &User) -> Result<()> {
         Self::upsert_user(self, user).map_err(Into::into)
+    }
+
+    fn resolve_author(&self, username: &str, real_id: &UserId) -> Result<()> {
+        Self::resolve_author(self, username, real_id).map_err(Into::into)
     }
 }
