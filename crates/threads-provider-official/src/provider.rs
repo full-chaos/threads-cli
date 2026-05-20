@@ -3,6 +3,9 @@ use chrono::{DateTime, Utc};
 use threads_core::{
     Cursor, Error, Media, MediaKind, Page, Post, PostId, Provider, Result, User, UserId,
 };
+use threads_core::publish::{
+    ContainerId, ContainerStatus, MediaInputKind, PublishRequest, PublishingLimits,
+};
 use threads_manifest::Manifest;
 
 use crate::{
@@ -71,6 +74,37 @@ impl OfficialProvider {
         path.replace("{post-id}", post_id.as_str())
             .replace("{reply-id}", post_id.as_str())
     }
+
+    pub(crate) fn substitute_container_id(path: &str, id: &ContainerId) -> String {
+        path.replace("{container-id}", id.as_str())
+    }
+}
+
+/// Build the query-string params for `POST /v1.0/me/threads`.
+/// All values are owned Strings because lifetimes from the request fields
+/// need to outlive the params slice passed to `post_json`.
+pub(crate) fn build_create_params(req: &PublishRequest) -> Vec<(&'static str, String)> {
+    let mut p: Vec<(&'static str, String)> = Vec::new();
+    p.push(("media_type", req.media_type.as_wire_str().to_string()));
+    if let Some(ref text) = req.text {
+        p.push(("text", text.clone()));
+    }
+    if let Some(ref rid) = req.reply_to_id {
+        p.push(("reply_to_id", rid.as_str().to_string()));
+    }
+    if let Some(ref rc) = req.reply_control {
+        p.push(("reply_control", rc.as_wire_str().to_string()));
+    }
+    if let Some(ref la) = req.link_attachment {
+        p.push(("link_attachment", la.clone()));
+    }
+    for m in &req.media {
+        match m.kind {
+            MediaInputKind::Image => p.push(("image_url", m.url.clone())),
+            MediaInputKind::Video => p.push(("video_url", m.url.clone())),
+        }
+    }
+    p
 }
 
 #[async_trait]
@@ -199,6 +233,102 @@ impl Provider for OfficialProvider {
         let _ = self.http.delete_json(&path, &[]).await?;
         Ok(())
     }
+
+    async fn create_container(
+        &self,
+        req: &PublishRequest,
+    ) -> threads_core::Result<ContainerId> {
+        let path = self
+            .action_path("post/create")
+            .ok_or_else(|| Error::Manifest("missing action `post/create`".into()))?;
+        let owned_params = build_create_params(req);
+        let borrowed: Vec<(&str, &str)> = owned_params
+            .iter()
+            .map(|(k, v)| (*k, v.as_str()))
+            .collect();
+        let val = self.http.post_json(&path, &borrowed).await?;
+        let resp: crate::dto::CreateContainerResp =
+            serde_json::from_value(val).map_err(threads_core::Error::from)?;
+        Ok(ContainerId::new(resp.id))
+    }
+
+    async fn publish_container(
+        &self,
+        id: &ContainerId,
+    ) -> threads_core::Result<threads_core::PostId> {
+        let path = self
+            .action_path("post/publish")
+            .ok_or_else(|| Error::Manifest("missing action `post/publish`".into()))?;
+        let creation_id = id.as_str().to_string();
+        let params: Vec<(&str, &str)> = vec![("creation_id", creation_id.as_str())];
+        let val = self.http.post_json(&path, &params).await?;
+        let resp: crate::dto::PublishResp =
+            serde_json::from_value(val).map_err(threads_core::Error::from)?;
+        Ok(threads_core::PostId::new(resp.id))
+    }
+
+    async fn container_status(
+        &self,
+        id: &ContainerId,
+    ) -> threads_core::Result<ContainerStatus> {
+        let path = self
+            .object_path("container")
+            .ok_or_else(|| Error::Manifest("missing object `container`".into()))?;
+        let path = Self::substitute_container_id(&path, id);
+        let fields = self.endpoint_fields("container").unwrap_or_else(|| "status".into());
+        let val: serde_json::Value = self
+            .http
+            .get_json(&path, &[("fields", fields.as_str())])
+            .await?;
+        let resp: crate::dto::ContainerStatusResp =
+            serde_json::from_value(val).map_err(threads_core::Error::from)?;
+        ContainerStatus::from_wire(&resp.status).ok_or_else(|| {
+            threads_core::Error::Parse(format!("unknown container status: {}", resp.status))
+        })
+    }
+
+    async fn publishing_limits(&self) -> threads_core::Result<PublishingLimits> {
+        let path = self
+            .object_path("publishing_limit")
+            .ok_or_else(|| Error::Manifest("missing object `publishing_limit`".into()))?;
+        let fields = self
+            .endpoint_fields("publishing_limit")
+            .unwrap_or_else(|| "quota_usage,config,reply_quota_usage,reply_config".into());
+        // The API may return a `{ "data": [ { ... } ] }` envelope.
+        let raw: serde_json::Value = self
+            .http
+            .get_json(&path, &[("fields", fields.as_str())])
+            .await?;
+        let item = if let Some(arr) = raw.get("data").and_then(|d| d.as_array()) {
+            arr.first()
+                .cloned()
+                .ok_or_else(|| threads_core::Error::Parse("publishing_limit data array is empty".into()))?
+        } else {
+            raw
+        };
+        let resp: crate::dto::PublishingLimitResp =
+            serde_json::from_value(item).map_err(threads_core::Error::from)?;
+        Ok(PublishingLimits {
+            post_usage: resp.quota_usage,
+            post_total: resp.config.quota_total,
+            reply_usage: resp.reply_quota_usage,
+            reply_total: resp.reply_config.quota_total,
+        })
+    }
+
+    async fn fetch_post(&self, id: &threads_core::PostId) -> threads_core::Result<threads_core::Post> {
+        let path = self
+            .object_path("post")
+            .ok_or_else(|| Error::Manifest("missing object `post`".into()))?;
+        let path = Self::substitute_post_id(&path, id);
+        let fields = self.endpoint_fields("post");
+        let mut q: Vec<(&str, &str)> = Vec::new();
+        if let Some(ref f) = fields {
+            q.push(("fields", f.as_str()));
+        }
+        let dto: crate::dto::PostDto = self.http.get_json(&path, &q).await?;
+        Ok(dto_to_post(dto, None))
+    }
 }
 
 pub(crate) fn envelope_to_page(env: Envelope<PostDto>, root_hint: Option<&PostId>) -> Page<Post> {
@@ -311,6 +441,77 @@ fn parse_timestamp(s: &str) -> Option<DateTime<Utc>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- publish param building ----
+
+    #[test]
+    fn create_container_text_params_include_media_type_and_text() {
+        use threads_core::publish::{PublishMediaType, PublishRequest};
+        let req = PublishRequest {
+            media_type: PublishMediaType::Text,
+            text: Some("Hello Threads!".into()),
+            reply_to_id: None,
+            reply_control: None,
+            link_attachment: None,
+            media: vec![],
+        };
+        let params = build_create_params(&req);
+        let map: std::collections::HashMap<&str, &str> =
+            params.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        assert_eq!(map.get("media_type").copied(), Some("TEXT"));
+        assert_eq!(map.get("text").copied(), Some("Hello Threads!"));
+        assert!(!params.iter().any(|(k, _)| *k == "reply_to_id"));
+    }
+
+    #[test]
+    fn create_container_reply_params_include_reply_to_id() {
+        use threads_core::{PostId, publish::{PublishMediaType, PublishRequest}};
+        let req = PublishRequest {
+            media_type: PublishMediaType::Text,
+            text: Some("a reply".into()),
+            reply_to_id: Some(PostId::new("parent_post_99")),
+            reply_control: None,
+            link_attachment: None,
+            media: vec![],
+        };
+        let params = build_create_params(&req);
+        let map: std::collections::HashMap<&str, &str> =
+            params.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        assert_eq!(map.get("reply_to_id").copied(), Some("parent_post_99"));
+    }
+
+    #[test]
+    fn create_container_image_params_include_image_url() {
+        use threads_core::publish::{MediaInput, MediaInputKind, PublishMediaType, PublishRequest};
+        let req = PublishRequest {
+            media_type: PublishMediaType::Image,
+            text: None,
+            reply_to_id: None,
+            reply_control: None,
+            link_attachment: None,
+            media: vec![MediaInput {
+                kind: MediaInputKind::Image,
+                url: "https://example.com/photo.jpg".into(),
+            }],
+        };
+        let params = build_create_params(&req);
+        let map: std::collections::HashMap<&str, &str> =
+            params.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        assert_eq!(map.get("media_type").copied(), Some("IMAGE"));
+        assert_eq!(
+            map.get("image_url").copied(),
+            Some("https://example.com/photo.jpg")
+        );
+    }
+
+    #[test]
+    fn substitute_container_id_replaces_placeholder() {
+        let path = "/v1.0/{container-id}";
+        use threads_core::publish::ContainerId;
+        let cid = ContainerId::new("ctr_42");
+        let result = OfficialProvider::substitute_container_id(path, &cid);
+        assert_eq!(result, "/v1.0/ctr_42");
+    }
 
     #[test]
     fn dto_to_post_synthesizes_author_from_username() {
