@@ -16,7 +16,12 @@ const ACCESS_TOKEN_BASE: &str = "https://graph.threads.net/access_token";
 const REFRESH_BASE: &str = "https://graph.threads.net/refresh_access_token";
 
 /// Default OAuth scopes covering v1 MVP behavior.
-pub const DEFAULT_SCOPES: &[&str] = &["threads_basic", "threads_read_replies", "threads_delete"];
+pub const DEFAULT_SCOPES: &[&str] = &[
+    "threads_basic",
+    "threads_read_replies",
+    "threads_delete",
+    "threads_content_publish",
+];
 
 /// Build the URL the user must visit to grant authorization.
 pub fn authorize_url(cfg: &Config, scopes: &[&str], state: &str) -> Result<Url> {
@@ -343,6 +348,14 @@ mod tests {
     #[test]
     fn default_scopes_include_delete_permission() {
         assert!(DEFAULT_SCOPES.contains(&"threads_delete"));
+    }
+
+    #[test]
+    fn default_scopes_include_content_publish() {
+        assert!(
+            DEFAULT_SCOPES.contains(&"threads_content_publish"),
+            "DEFAULT_SCOPES must include threads_content_publish for the post create command; got: {DEFAULT_SCOPES:?}"
+        );
     }
 
     #[test]
