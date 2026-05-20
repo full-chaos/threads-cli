@@ -17,6 +17,7 @@ pub mod delete;
 pub mod export;
 pub mod ingest;
 pub mod init;
+pub mod post;
 pub mod search;
 pub mod show;
 
@@ -49,6 +50,7 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
             cli.format.into(),
         ),
         Command::Delete(cmd) => delete::run(cmd, cli.config.as_deref(), cli.db.as_deref()).await,
+        Command::Post(cmd) => post::run_post(cmd, cli.config.as_deref(), cli.db.as_deref()).await,
     }
 }
 
