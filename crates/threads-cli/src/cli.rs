@@ -74,6 +74,10 @@ pub enum Command {
     /// Default is DRY-RUN; pass --apply to actually delete.
     #[command(subcommand)]
     Delete(DeleteCommand),
+
+    /// Publish a new post or reply to Threads.
+    #[command(subcommand)]
+    Post(PostCommand),
 }
 
 #[derive(Debug, clap::Args)]
@@ -173,6 +177,51 @@ pub struct DeleteArgs {
     pub yes_undocumented: bool,
 }
 
+#[derive(Debug, Subcommand)]
+pub enum PostCommand {
+    /// Create and publish a text, image, video, or carousel post (or reply).
+    Create(PostCreateArgs),
+}
+
+/// Clap-facing enum for `--reply-control`.
+#[derive(Copy, Clone, Debug, ValueEnum)]
+pub enum ReplyControlArg {
+    Everyone,
+    AccountsYouFollow,
+    MentionedOnly,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct PostCreateArgs {
+    /// Text body of the post. Pass `-` to read from stdin.
+    #[arg(long)]
+    pub text: Option<String>,
+
+    /// Create as a reply to this post id.
+    #[arg(long)]
+    pub reply_to: Option<String>,
+
+    /// Public HTTPS URL of an image to attach (repeatable; ≥2 media ⇒ carousel).
+    #[arg(long)]
+    pub image_url: Vec<String>,
+
+    /// Public HTTPS URL of a video to attach (repeatable).
+    #[arg(long)]
+    pub video_url: Vec<String>,
+
+    /// Control who can reply to this post.
+    #[arg(long, value_enum)]
+    pub reply_control: Option<ReplyControlArg>,
+
+    /// Attach a link preview URL.
+    #[arg(long)]
+    pub link_attachment: Option<String>,
+
+    /// Skip the interactive confirmation prompt (required when not on a TTY).
+    #[arg(long)]
+    pub yes: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -181,5 +230,53 @@ mod tests {
     #[test]
     fn cli_structure_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn post_create_args_parse_correctly() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from([
+            "threads-cli",
+            "post",
+            "create",
+            "--text",
+            "Hello world",
+            "--yes",
+        ])
+        .expect("should parse");
+        match cli.command {
+            Command::Post(PostCommand::Create(args)) => {
+                assert_eq!(args.text.as_deref(), Some("Hello world"));
+                assert!(args.yes);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn post_create_reply_args_parse_correctly() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from([
+            "threads-cli",
+            "post",
+            "create",
+            "--text",
+            "A reply",
+            "--reply-to",
+            "post_abc",
+            "--reply-control",
+            "mentioned-only",
+        ])
+        .expect("should parse");
+        match cli.command {
+            Command::Post(PostCommand::Create(args)) => {
+                assert_eq!(args.reply_to.as_deref(), Some("post_abc"));
+                assert!(matches!(
+                    args.reply_control,
+                    Some(ReplyControlArg::MentionedOnly)
+                ));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
     }
 }

@@ -12,6 +12,7 @@
 pub mod error;
 pub mod model;
 pub mod provider;
+pub mod publish;
 
 pub use error::{Error, Result};
 pub use model::{
@@ -19,3 +20,7 @@ pub use model::{
     User, UserId,
 };
 pub use provider::Provider;
+pub use publish::{
+    ContainerId, ContainerStatus, MediaInput, MediaInputKind, PublishMediaType, PublishRequest,
+    PublishingLimits, ReplyControl, validate_text,
+};

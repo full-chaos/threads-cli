@@ -290,6 +290,8 @@ struct MockStoreState {
     upserted: Vec<Post>,
     run_started: Vec<FetchRun>,
     run_ended: Vec<(String, u64, Option<String>)>,
+    upserted_users: Vec<User>,
+    resolve_author_calls: Vec<(String, UserId)>,
 }
 
 struct MockStore {
@@ -342,6 +344,18 @@ impl StoreWrite for MockStore {
             .filter(|p| &p.author == author)
             .map(|p| p.id.clone())
             .collect())
+    }
+
+    fn upsert_user(&self, user: &User) -> Result<()> {
+        let mut s = self.state.lock().unwrap();
+        s.upserted_users.push(user.clone());
+        Ok(())
+    }
+
+    fn resolve_author(&self, username: &str, real_id: &UserId) -> Result<()> {
+        let mut s = self.state.lock().unwrap();
+        s.resolve_author_calls.push((username.to_string(), real_id.clone()));
+        Ok(())
     }
 }
 
@@ -685,4 +699,78 @@ async fn engagement_deduplicates_across_seeds_and_levels() {
         .filter(|p| p.id == PostId::new("shared"))
         .count();
     assert_eq!(shared_count, 1);
+}
+
+#[tokio::test]
+async fn ingest_engagement_upserts_me_profile() {
+    let me = User {
+        id: UserId::new("real_id_42"),
+        username: Some("alice".into()),
+        name: Some("Alice".into()),
+        biography: None,
+        profile_picture_url: None,
+    };
+    let my_post = Post {
+        id: PostId::new("my_post_e"),
+        author: UserId::new("real_id_42"),
+        text: Some("seed".into()),
+        created_at: None,
+        parent_id: None,
+        root_id: None,
+        permalink: None,
+        media: vec![],
+        urls: vec![],
+        mentions: vec![],
+        is_quote_post: false,
+        raw: None,
+    };
+    let provider = Arc::new(MockProvider::new(vec![]).with_me(me.clone()));
+    let store = MockStore::new();
+    store.upsert_posts(std::slice::from_ref(&my_post), None).unwrap();
+
+    let ingestor = Ingestor::new(provider, Box::new(NoopNormalizer), Arc::clone(&store));
+    ingestor.ingest_engagement(1).await.expect("ingest_engagement failed");
+
+    let state = store.state.lock().unwrap();
+    assert!(state.upserted_users.iter().any(|u| u.id == UserId::new("real_id_42")),
+        "me profile must be upserted during ingest_engagement");
+}
+
+#[tokio::test]
+async fn ingest_me_upserts_me_profile() {
+    let me = User {
+        id: UserId::new("real_id_99"),
+        username: Some("bob".into()),
+        name: None,
+        biography: None,
+        profile_picture_url: None,
+    };
+    let page = vec![MockProvider::make_post("p_for_me", "real_id_99")];
+    let provider = Arc::new(MockProvider::new(vec![page]).with_me(me.clone()));
+    let store = MockStore::new();
+
+    let ingestor = Ingestor::new(provider, Box::new(NoopNormalizer), Arc::clone(&store));
+    ingestor.ingest_me().await.expect("ingest_me failed");
+
+    let state = store.state.lock().unwrap();
+    assert!(state.upserted_users.iter().any(|u| u.id == UserId::new("real_id_99")),
+        "me profile must be upserted during ingest_me");
+}
+
+#[tokio::test]
+async fn resolve_author_called_with_correct_args() {
+    let me = User {
+        id: UserId::new("real_77"),
+        username: Some("carol".into()),
+        name: None, biography: None, profile_picture_url: None,
+    };
+    let provider = Arc::new(MockProvider::new(vec![vec![]]).with_me(me.clone()));
+    let store = MockStore::new();
+    let ingestor = Ingestor::new(provider, Box::new(NoopNormalizer), Arc::clone(&store));
+    ingestor.ingest_me().await.expect("ingest_me failed");
+    let state = store.state.lock().unwrap();
+    assert!(
+        state.resolve_author_calls.iter().any(|(u, id)| u == "carol" && *id == UserId::new("real_77")),
+        "resolve_author must be called with (\"carol\", UserId(\"real_77\"))"
+    );
 }

@@ -178,6 +178,14 @@ impl<P: Provider + 'static, S: StoreWrite + 'static> Ingestor<P, S> {
     // --- private helpers ---
 
     async fn run_ingest_me(&self, run_id: &str) -> Result<u64> {
+        // Persist the authenticated user's profile so the users table has
+        // username/name/bio (and so author resolution can run later).
+        let me = self.provider.fetch_me().await?;
+        self.store.upsert_user(&me)?;
+        if let Some(username) = &me.username {
+            self.store.resolve_author(username, &me.id)?;
+        }
+
         let mut seen: HashSet<PostId> = HashSet::new();
         let mut batch = Vec::new();
         let mut total: u64 = 0;
@@ -242,6 +250,10 @@ impl<P: Provider + 'static, S: StoreWrite + 'static> Ingestor<P, S> {
     async fn run_ingest_engagement(&self, run_id: &str, max_depth: u32) -> Result<u64> {
         // Seed: every post in the store authored by the authenticated user.
         let me = self.provider.fetch_me().await?;
+        self.store.upsert_user(&me)?;
+        if let Some(username) = &me.username {
+            self.store.resolve_author(username, &me.id)?;
+        }
         let seeds = self.store.posts_by_author(&me.id)?;
         info!(
             seeds = seeds.len(),

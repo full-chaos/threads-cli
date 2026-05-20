@@ -789,4 +789,108 @@ mod tests {
             Some("M2".to_string())
         );
     }
+
+    // ------------------------------------------------------------------ //
+    //  Merge: re-upsert via sparse reply preserves rich root              //
+    // ------------------------------------------------------------------ //
+
+    #[test]
+    fn reupsert_via_sparse_reply_preserves_rich_root() {
+        let store = Store::open_in_memory().unwrap();
+
+        // 1. Insert a rich root post: media, urls, mentions, permalink, real author, quote.
+        let rich = Post {
+            id: PostId::new("root_merge"),
+            author: UserId::new("123456"),
+            text: Some("rich post text".into()),
+            created_at: Some(Utc::now()),
+            parent_id: None,
+            root_id: None,
+            permalink: Some("https://threads.net/p/rich".into()),
+            media: vec![Media { kind: MediaKind::Image, url: Some("https://example.com/img.jpg".into()), thumbnail_url: None }],
+            urls: vec![UrlEntity { url: "https://threads.net".into(), display_text: Some("threads".into()) }],
+            mentions: vec![Mention { username: "bob".into(), user_id: None }],
+            is_quote_post: true,
+            raw: None,
+        };
+        store.upsert_post(&rich, None).unwrap();
+
+        // 2. Re-upsert the same id with a SPARSE version (as a reply-edge re-fetch would yield).
+        let sparse = Post {
+            id: PostId::new("root_merge"),
+            author: UserId::new("@alice"),
+            text: None,
+            created_at: None,
+            parent_id: None,
+            root_id: None,
+            permalink: None,
+            media: vec![],
+            urls: vec![],
+            mentions: vec![],
+            is_quote_post: false,
+            raw: Some(serde_json::json!({ "sparse": true })),
+        };
+        store.upsert_post(&sparse, None).unwrap();
+
+        // 3. Assert the rich fields survived the sparse re-upsert.
+        let fetched = store.get_post(&PostId::new("root_merge")).unwrap().expect("post must exist");
+        assert_eq!(fetched.author, UserId::new("123456"), "real author must survive");
+        assert_eq!(fetched.text.as_deref(), Some("rich post text"), "text must survive");
+        assert!(fetched.created_at.is_some(), "created_at must survive");
+        assert_eq!(fetched.permalink.as_deref(), Some("https://threads.net/p/rich"), "permalink must survive");
+        assert_eq!(fetched.media.len(), 1, "media must survive");
+        assert_eq!(fetched.urls.len(), 1, "urls must survive");
+        assert_eq!(fetched.mentions.len(), 1, "mentions must survive");
+        assert!(fetched.is_quote_post, "is_quote_post must stay true");
+    }
+
+    // ------------------------------------------------------------------ //
+    //  Author resolution                                                  //
+    // ------------------------------------------------------------------ //
+
+    #[test]
+    fn resolve_author_rewrites_handle_to_real_id() {
+        let store = Store::open_in_memory().unwrap();
+        let post = Post {
+            id: PostId::new("post_under_handle"),
+            author: UserId::new("@alice"),
+            text: Some("written by alice".into()),
+            created_at: Some(Utc::now()),
+            parent_id: None, root_id: None, permalink: None,
+            media: vec![], urls: vec![], mentions: vec![], is_quote_post: false, raw: None,
+        };
+        store.upsert_post(&post, None).unwrap();
+
+        store.resolve_author("alice", &UserId::new("99999")).unwrap();
+
+        let fetched = store.get_post(&PostId::new("post_under_handle")).unwrap().expect("post must exist");
+        assert_eq!(fetched.author, UserId::new("99999"), "author must be rewritten to real id");
+
+        let conn = store.raw_conn();
+        let placeholder_count: i64 = conn.query_row("SELECT COUNT(*) FROM users WHERE id = '@alice'", [], |r| r.get(0)).unwrap();
+        assert_eq!(placeholder_count, 0, "@alice placeholder user must be deleted");
+        let real_count: i64 = conn.query_row("SELECT COUNT(*) FROM users WHERE id = '99999'", [], |r| r.get(0)).unwrap();
+        assert_eq!(real_count, 1, "real user row must exist after resolution");
+    }
+
+    #[test]
+    fn posts_by_author_finds_my_replies_after_resolution() {
+        let store = Store::open_in_memory().unwrap();
+        let reply = Post {
+            id: PostId::new("reply_under_handle"),
+            author: UserId::new("@alice"),
+            text: Some("my reply".into()),
+            created_at: Some(Utc::now()),
+            parent_id: Some(PostId::new("some_root")),
+            root_id: Some(PostId::new("some_root")),
+            permalink: None, media: vec![], urls: vec![], mentions: vec![], is_quote_post: false, raw: None,
+        };
+        store.upsert_post(&reply, None).unwrap();
+
+        assert!(store.posts_by_author(&UserId::new("99999")).unwrap().is_empty(), "no posts under real id before resolution");
+        store.resolve_author("alice", &UserId::new("99999")).unwrap();
+        let after = store.posts_by_author(&UserId::new("99999")).unwrap();
+        assert_eq!(after.len(), 1, "reply must be found under real id after resolution");
+        assert_eq!(after[0], PostId::new("reply_under_handle"));
+    }
 }

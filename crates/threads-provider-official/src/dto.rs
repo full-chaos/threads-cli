@@ -89,6 +89,43 @@ pub struct Cursors {
     pub after: Option<String>,
 }
 
+/// Response from `POST /v1.0/me/threads` (create container).
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct CreateContainerResp {
+    pub id: String,
+}
+
+/// Response from `POST /v1.0/me/threads_publish`.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct PublishResp {
+    pub id: String,
+}
+
+/// Response from `GET /{container-id}?fields=status`.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ContainerStatusResp {
+    pub status: String,
+}
+
+/// One element from `GET /me/threads_publishing_limit`.
+/// The API wraps this in `{ "data": [ { ... } ] }` when field-projected;
+/// the provider extracts `data[0]` before deserializing into this struct.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct PublishingLimitResp {
+    #[serde(default)]
+    pub quota_usage: u32,
+    pub config: PublishingLimitConfig,
+    #[serde(default)]
+    pub reply_quota_usage: u32,
+    pub reply_config: PublishingLimitConfig,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct PublishingLimitConfig {
+    pub quota_total: u32,
+    pub quota_duration: u64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -128,5 +165,56 @@ mod tests {
         assert_eq!(p.replied_to.unwrap().id, "p1");
         assert_eq!(p.root_post.unwrap().id, "root1");
         assert_eq!(p.is_reply, Some(true));
+    }
+
+    #[test]
+    fn parses_create_container_resp() {
+        let v = r#"{"id":"container_abc123"}"#;
+        let r: CreateContainerResp = serde_json::from_str(v).unwrap();
+        assert_eq!(r.id, "container_abc123");
+    }
+
+    #[test]
+    fn parses_publish_resp() {
+        let v = r#"{"id":"post_xyz999"}"#;
+        let r: PublishResp = serde_json::from_str(v).unwrap();
+        assert_eq!(r.id, "post_xyz999");
+    }
+
+    #[test]
+    fn parses_container_status_resp() {
+        let v = r#"{"status":"FINISHED"}"#;
+        let r: ContainerStatusResp = serde_json::from_str(v).unwrap();
+        assert_eq!(r.status, "FINISHED");
+    }
+
+    #[test]
+    fn parses_publishing_limit_resp_full() {
+        let v = r#"{
+            "quota_usage": 3,
+            "config": { "quota_total": 250, "quota_duration": 86400 },
+            "reply_quota_usage": 12,
+            "reply_config": { "quota_total": 1000, "quota_duration": 86400 }
+        }"#;
+        let r: PublishingLimitResp = serde_json::from_str(v).unwrap();
+        assert_eq!(r.quota_usage, 3);
+        assert_eq!(r.config.quota_total, 250);
+        assert_eq!(r.reply_quota_usage, 12);
+        assert_eq!(r.reply_config.quota_total, 1000);
+    }
+
+    #[test]
+    fn parses_publishing_limit_resp_wrapped_in_data_array() {
+        // The API returns this as `{ "data": [{ ... }] }` when using fields=.
+        // We parse the inner element only (provider unwraps data[0]).
+        let inner = r#"{
+            "quota_usage": 0,
+            "config": { "quota_total": 250, "quota_duration": 86400 },
+            "reply_quota_usage": 0,
+            "reply_config": { "quota_total": 1000, "quota_duration": 86400 }
+        }"#;
+        let r: PublishingLimitResp = serde_json::from_str(inner).unwrap();
+        assert_eq!(r.quota_usage, 0);
+        assert_eq!(r.config.quota_total, 250);
     }
 }

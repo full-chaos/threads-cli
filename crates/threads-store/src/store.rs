@@ -144,6 +144,13 @@ impl Store {
         query::thread_rooted_at(&conn, root_id)
     }
 
+    /// Resolve all posts stored under `'@' || username` to `real_id`, upsert the
+    /// real user, and delete the placeholder user row.
+    pub fn resolve_author(&self, username: &str, real_id: &UserId) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        query::resolve_author(&mut conn, username, real_id)
+    }
+
     pub fn record_fetch_run_start(&self, run: &FetchRun) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         query::record_fetch_run_start(&conn, run)

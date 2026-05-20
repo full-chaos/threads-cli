@@ -154,6 +154,43 @@ pub struct FetchRun {
     pub error: Option<String>,
 }
 
+impl Post {
+    /// Choose between an incoming and existing author id, preferring the
+    /// non-`@`-prefixed (real numeric) id. Ties (both real or both handles)
+    /// go to `incoming`.
+    fn prefer_real(incoming: UserId, existing: UserId) -> UserId {
+        match (incoming.as_str().starts_with('@'), existing.as_str().starts_with('@')) {
+            (false, true) => incoming, // incoming real, existing handle
+            (true, false) => existing, // incoming handle, existing real
+            _ => incoming,
+        }
+    }
+
+    /// Merge a re-fetched `incoming` post onto an `existing` stored post,
+    /// never losing data to a sparser fetch.
+    /// - text/created_at/permalink/parent_id/root_id: `incoming.or(existing)`
+    /// - author: prefer a real id over an `@handle`
+    /// - is_quote_post: sticky true (`existing || incoming`)
+    /// - media/urls/mentions: incoming unless empty, then existing
+    /// - id/raw: always incoming
+    pub fn merge(existing: Post, incoming: Post) -> Post {
+        Post {
+            id: incoming.id,
+            author: Self::prefer_real(incoming.author, existing.author),
+            text: incoming.text.or(existing.text),
+            created_at: incoming.created_at.or(existing.created_at),
+            parent_id: incoming.parent_id.or(existing.parent_id),
+            root_id: incoming.root_id.or(existing.root_id),
+            permalink: incoming.permalink.or(existing.permalink),
+            is_quote_post: existing.is_quote_post || incoming.is_quote_post,
+            media: if incoming.media.is_empty() { existing.media } else { incoming.media },
+            urls: if incoming.urls.is_empty() { existing.urls } else { incoming.urls },
+            mentions: if incoming.mentions.is_empty() { existing.mentions } else { incoming.mentions },
+            raw: incoming.raw,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,5 +221,169 @@ mod tests {
         let p: Page<Post> = Page::empty();
         assert!(p.items.is_empty());
         assert!(p.next.is_none());
+    }
+
+    // ------------------------------------------------------------------ //
+    //  Post::merge                                                        //
+    // ------------------------------------------------------------------ //
+
+    fn ts(s: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    }
+
+    fn rich_post() -> Post {
+        Post {
+            id: PostId::new("p1"),
+            author: UserId::new("123456"),
+            text: Some("hello threads".into()),
+            created_at: Some(ts("2026-01-01T00:00:00+00:00")),
+            parent_id: Some(PostId::new("parent-root")),
+            root_id: Some(PostId::new("parent-root")),
+            permalink: Some("https://threads.net/p/abc".into()),
+            media: vec![Media { kind: MediaKind::Image, url: Some("https://example.com/img.jpg".into()), thumbnail_url: None }],
+            urls: vec![UrlEntity { url: "https://example.com".into(), display_text: Some("example".into()) }],
+            mentions: vec![Mention { username: "bob".into(), user_id: Some(UserId::new("789")) }],
+            is_quote_post: true,
+            raw: Some(serde_json::json!({ "id": "p1" })),
+        }
+    }
+
+    fn sparse_post() -> Post {
+        Post {
+            id: PostId::new("p1"),
+            author: UserId::new("@alice"),
+            text: None,
+            created_at: None,
+            parent_id: None,
+            root_id: None,
+            permalink: None,
+            media: vec![],
+            urls: vec![],
+            mentions: vec![],
+            is_quote_post: false,
+            raw: Some(serde_json::json!({ "id": "p1", "sparse": true })),
+        }
+    }
+
+    #[test]
+    fn merge_keeps_known_created_at_when_incoming_none() {
+        let existing = rich_post();
+        let merged = Post::merge(existing.clone(), sparse_post());
+        assert_eq!(merged.created_at, existing.created_at);
+    }
+
+    #[test]
+    fn merge_incoming_created_at_wins_when_both_present() {
+        let mut incoming = sparse_post();
+        incoming.created_at = Some(ts("2026-06-01T12:00:00+00:00"));
+        let merged = Post::merge(rich_post(), incoming.clone());
+        assert_eq!(merged.created_at, incoming.created_at);
+    }
+
+    #[test]
+    fn merge_keeps_known_text_when_incoming_none() {
+        let existing = rich_post();
+        let merged = Post::merge(existing.clone(), sparse_post());
+        assert_eq!(merged.text, existing.text);
+    }
+
+    #[test]
+    fn merge_keeps_known_permalink_when_incoming_none() {
+        let existing = rich_post();
+        let merged = Post::merge(existing.clone(), sparse_post());
+        assert_eq!(merged.permalink, existing.permalink);
+    }
+
+    #[test]
+    fn merge_keeps_known_parent_id_when_incoming_none() {
+        let existing = rich_post();
+        let merged = Post::merge(existing.clone(), sparse_post());
+        assert_eq!(merged.parent_id, existing.parent_id);
+    }
+
+    #[test]
+    fn merge_keeps_known_root_id_when_incoming_none() {
+        let existing = rich_post();
+        let merged = Post::merge(existing.clone(), sparse_post());
+        assert_eq!(merged.root_id, existing.root_id);
+    }
+
+    #[test]
+    fn merge_prefers_real_author_over_handle() {
+        let existing = rich_post(); // author = "123456"
+        let merged = Post::merge(existing.clone(), sparse_post()); // incoming "@alice"
+        assert_eq!(merged.author, existing.author);
+    }
+
+    #[test]
+    fn merge_incoming_real_author_beats_existing_handle() {
+        let mut existing = rich_post();
+        existing.author = UserId::new("@alice");
+        let mut incoming = sparse_post();
+        incoming.author = UserId::new("654321");
+        let merged = Post::merge(existing, incoming.clone());
+        assert_eq!(merged.author, incoming.author);
+    }
+
+    #[test]
+    fn merge_both_handles_incoming_wins() {
+        let mut existing = rich_post();
+        existing.author = UserId::new("@alice");
+        let mut incoming = sparse_post();
+        incoming.author = UserId::new("@bob");
+        let merged = Post::merge(existing, incoming.clone());
+        assert_eq!(merged.author, incoming.author);
+    }
+
+    #[test]
+    fn merge_is_quote_post_sticky_true() {
+        let merged = Post::merge(rich_post(), sparse_post()); // true, then false
+        assert!(merged.is_quote_post);
+    }
+
+    #[test]
+    fn merge_is_quote_post_false_plus_true_becomes_true() {
+        let mut existing = rich_post();
+        existing.is_quote_post = false;
+        let mut incoming = sparse_post();
+        incoming.is_quote_post = true;
+        assert!(Post::merge(existing, incoming).is_quote_post);
+    }
+
+    #[test]
+    fn merge_keeps_media_when_incoming_empty() {
+        let existing = rich_post();
+        let merged = Post::merge(existing.clone(), sparse_post());
+        assert_eq!(merged.media, existing.media);
+    }
+
+    #[test]
+    fn merge_incoming_media_wins_when_nonempty() {
+        let mut incoming = sparse_post();
+        incoming.media = vec![Media { kind: MediaKind::Video, url: Some("https://example.com/v.mp4".into()), thumbnail_url: None }];
+        let merged = Post::merge(rich_post(), incoming.clone());
+        assert_eq!(merged.media, incoming.media);
+    }
+
+    #[test]
+    fn merge_keeps_urls_when_incoming_empty() {
+        let existing = rich_post();
+        let merged = Post::merge(existing.clone(), sparse_post());
+        assert_eq!(merged.urls, existing.urls);
+    }
+
+    #[test]
+    fn merge_keeps_mentions_when_incoming_empty() {
+        let existing = rich_post();
+        let merged = Post::merge(existing.clone(), sparse_post());
+        assert_eq!(merged.mentions, existing.mentions);
+    }
+
+    #[test]
+    fn merge_id_and_raw_always_from_incoming() {
+        let incoming = sparse_post();
+        let merged = Post::merge(rich_post(), incoming.clone());
+        assert_eq!(merged.id, incoming.id);
+        assert_eq!(merged.raw, incoming.raw);
     }
 }

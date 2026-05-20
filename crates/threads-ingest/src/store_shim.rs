@@ -6,7 +6,7 @@
 //! `StoreWrite for threads_store::Store` and wire the two crates together.
 
 use chrono::{DateTime, Utc};
-use threads_core::{FetchRun, Post, PostId, Result, UserId};
+use threads_core::{FetchRun, Post, PostId, Result, User, UserId};
 
 /// Write interface required by the ingestion orchestrator.
 ///
@@ -35,6 +35,13 @@ pub trait StoreWrite: Send + Sync {
     /// Return the ids of every post authored by `author`. Used by
     /// `ingest_engagement` to enumerate seeds for the BFS.
     fn posts_by_author(&self, author: &UserId) -> Result<Vec<PostId>>;
+
+    /// Upsert the authenticated user's profile row.
+    fn upsert_user(&self, user: &User) -> Result<()>;
+
+    /// Resolve all posts stored under `'@' || username` to `real_id`, upsert
+    /// the real user, and delete the placeholder user row.
+    fn resolve_author(&self, username: &str, real_id: &UserId) -> Result<()>;
 }
 
 impl StoreWrite for threads_store::Store {
@@ -62,5 +69,13 @@ impl StoreWrite for threads_store::Store {
 
     fn posts_by_author(&self, author: &UserId) -> Result<Vec<PostId>> {
         Self::posts_by_author(self, author).map_err(Into::into)
+    }
+
+    fn upsert_user(&self, user: &User) -> Result<()> {
+        Self::upsert_user(self, user).map_err(Into::into)
+    }
+
+    fn resolve_author(&self, username: &str, real_id: &UserId) -> Result<()> {
+        Self::resolve_author(self, username, real_id).map_err(Into::into)
     }
 }
