@@ -4,7 +4,7 @@ use threads_core::{
     Cursor, Error, Media, MediaKind, Page, Post, PostId, Provider, Result, User, UserId,
 };
 use threads_core::publish::{
-    ContainerId, ContainerStatus, MediaInputKind, PublishRequest, PublishingLimits,
+    ContainerId, ContainerStatus, MediaInput, MediaInputKind, PublishRequest, PublishingLimits,
 };
 use threads_manifest::Manifest;
 
@@ -104,6 +104,50 @@ pub(crate) fn build_create_params(req: &PublishRequest) -> Vec<(&'static str, St
             MediaInputKind::Video => p.push(("video_url", m.url.clone())),
         }
     }
+    p
+}
+
+/// Build the query-string params for one carousel CHILD container.
+/// Always sets `is_carousel_item=true`.
+pub(crate) fn build_carousel_item_params(item: &MediaInput) -> Vec<(&'static str, String)> {
+    let mut p: Vec<(&'static str, String)> = Vec::new();
+    match item.kind {
+        MediaInputKind::Image => {
+            p.push(("media_type", "IMAGE".to_string()));
+            p.push(("image_url", item.url.clone()));
+        }
+        MediaInputKind::Video => {
+            p.push(("media_type", "VIDEO".to_string()));
+            p.push(("video_url", item.url.clone()));
+        }
+    }
+    p.push(("is_carousel_item", "true".to_string()));
+    p
+}
+
+/// Build the query-string params for the carousel PARENT container.
+/// `children` is the comma-separated list of already-created child container ids.
+pub(crate) fn build_carousel_parent_params(
+    req: &PublishRequest,
+    children: &[ContainerId],
+) -> Vec<(&'static str, String)> {
+    let mut p: Vec<(&'static str, String)> = Vec::new();
+    p.push(("media_type", "CAROUSEL".to_string()));
+    if let Some(ref text) = req.text {
+        p.push(("text", text.clone()));
+    }
+    if let Some(ref rid) = req.reply_to_id {
+        p.push(("reply_to_id", rid.as_str().to_string()));
+    }
+    if let Some(ref rc) = req.reply_control {
+        p.push(("reply_control", rc.as_wire_str().to_string()));
+    }
+    let csv = children
+        .iter()
+        .map(|c| c.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+    p.push(("children", csv));
     p
 }
 
@@ -329,6 +373,43 @@ impl Provider for OfficialProvider {
         let dto: crate::dto::PostDto = self.http.get_json(&path, &q).await?;
         Ok(dto_to_post(dto, None))
     }
+
+    async fn create_carousel_item(
+        &self,
+        item: &MediaInput,
+    ) -> threads_core::Result<ContainerId> {
+        let path = self
+            .action_path("post/create")
+            .ok_or_else(|| threads_core::Error::Manifest("missing action `post/create`".into()))?;
+        let owned_params = build_carousel_item_params(item);
+        let borrowed: Vec<(&str, &str)> = owned_params
+            .iter()
+            .map(|(k, v)| (*k, v.as_str()))
+            .collect();
+        let val = self.http.post_json(&path, &borrowed).await?;
+        let resp: crate::dto::CreateContainerResp =
+            serde_json::from_value(val).map_err(threads_core::Error::from)?;
+        Ok(ContainerId::new(resp.id))
+    }
+
+    async fn create_carousel_container(
+        &self,
+        req: &PublishRequest,
+        children: &[ContainerId],
+    ) -> threads_core::Result<ContainerId> {
+        let path = self
+            .action_path("post/create")
+            .ok_or_else(|| threads_core::Error::Manifest("missing action `post/create`".into()))?;
+        let owned_params = build_carousel_parent_params(req, children);
+        let borrowed: Vec<(&str, &str)> = owned_params
+            .iter()
+            .map(|(k, v)| (*k, v.as_str()))
+            .collect();
+        let val = self.http.post_json(&path, &borrowed).await?;
+        let resp: crate::dto::CreateContainerResp =
+            serde_json::from_value(val).map_err(threads_core::Error::from)?;
+        Ok(ContainerId::new(resp.id))
+    }
 }
 
 pub(crate) fn envelope_to_page(env: Envelope<PostDto>, root_hint: Option<&PostId>) -> Page<Post> {
@@ -511,6 +592,45 @@ mod tests {
         let cid = ContainerId::new("ctr_42");
         let result = OfficialProvider::substitute_container_id(path, &cid);
         assert_eq!(result, "/v1.0/ctr_42");
+    }
+
+    #[test]
+    fn carousel_item_params_set_is_carousel_item() {
+        use threads_core::publish::{MediaInput, MediaInputKind};
+        let item = MediaInput {
+            kind: MediaInputKind::Image,
+            url: "https://example.com/img.jpg".into(),
+        };
+        let params = build_carousel_item_params(&item);
+        let map: std::collections::HashMap<&str, &str> =
+            params.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        assert_eq!(map.get("media_type").copied(), Some("IMAGE"));
+        assert_eq!(
+            map.get("image_url").copied(),
+            Some("https://example.com/img.jpg")
+        );
+        assert_eq!(map.get("is_carousel_item").copied(), Some("true"));
+    }
+
+    #[test]
+    fn carousel_parent_params_set_children_csv() {
+        use threads_core::{PostId, publish::{ContainerId, PublishMediaType, PublishRequest}};
+        let req = PublishRequest {
+            media_type: PublishMediaType::Carousel,
+            text: Some("carousel caption".into()),
+            reply_to_id: Some(PostId::new("parent_post_7")),
+            reply_control: None,
+            link_attachment: None,
+            media: vec![],
+        };
+        let children = vec![ContainerId::new("ctr_1"), ContainerId::new("ctr_2")];
+        let params = build_carousel_parent_params(&req, &children);
+        let map: std::collections::HashMap<&str, &str> =
+            params.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        assert_eq!(map.get("media_type").copied(), Some("CAROUSEL"));
+        assert_eq!(map.get("children").copied(), Some("ctr_1,ctr_2"));
+        assert_eq!(map.get("text").copied(), Some("carousel caption"));
+        assert_eq!(map.get("reply_to_id").copied(), Some("parent_post_7"));
     }
 
     #[test]
