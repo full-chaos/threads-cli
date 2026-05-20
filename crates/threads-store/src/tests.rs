@@ -789,4 +789,58 @@ mod tests {
             Some("M2".to_string())
         );
     }
+
+    // ------------------------------------------------------------------ //
+    //  Merge: re-upsert via sparse reply preserves rich root              //
+    // ------------------------------------------------------------------ //
+
+    #[test]
+    fn reupsert_via_sparse_reply_preserves_rich_root() {
+        let store = Store::open_in_memory().unwrap();
+
+        // 1. Insert a rich root post: media, urls, mentions, permalink, real author, quote.
+        let rich = Post {
+            id: PostId::new("root_merge"),
+            author: UserId::new("123456"),
+            text: Some("rich post text".into()),
+            created_at: Some(Utc::now()),
+            parent_id: None,
+            root_id: None,
+            permalink: Some("https://threads.net/p/rich".into()),
+            media: vec![Media { kind: MediaKind::Image, url: Some("https://example.com/img.jpg".into()), thumbnail_url: None }],
+            urls: vec![UrlEntity { url: "https://threads.net".into(), display_text: Some("threads".into()) }],
+            mentions: vec![Mention { username: "bob".into(), user_id: None }],
+            is_quote_post: true,
+            raw: None,
+        };
+        store.upsert_post(&rich, None).unwrap();
+
+        // 2. Re-upsert the same id with a SPARSE version (as a reply-edge re-fetch would yield).
+        let sparse = Post {
+            id: PostId::new("root_merge"),
+            author: UserId::new("@alice"),
+            text: None,
+            created_at: None,
+            parent_id: None,
+            root_id: None,
+            permalink: None,
+            media: vec![],
+            urls: vec![],
+            mentions: vec![],
+            is_quote_post: false,
+            raw: Some(serde_json::json!({ "sparse": true })),
+        };
+        store.upsert_post(&sparse, None).unwrap();
+
+        // 3. Assert the rich fields survived the sparse re-upsert.
+        let fetched = store.get_post(&PostId::new("root_merge")).unwrap().expect("post must exist");
+        assert_eq!(fetched.author, UserId::new("123456"), "real author must survive");
+        assert_eq!(fetched.text.as_deref(), Some("rich post text"), "text must survive");
+        assert!(fetched.created_at.is_some(), "created_at must survive");
+        assert_eq!(fetched.permalink.as_deref(), Some("https://threads.net/p/rich"), "permalink must survive");
+        assert_eq!(fetched.media.len(), 1, "media must survive");
+        assert_eq!(fetched.urls.len(), 1, "urls must survive");
+        assert_eq!(fetched.mentions.len(), 1, "mentions must survive");
+        assert!(fetched.is_quote_post, "is_quote_post must stay true");
+    }
 }

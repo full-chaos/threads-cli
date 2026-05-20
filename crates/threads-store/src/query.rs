@@ -79,6 +79,24 @@ pub fn upsert_user(conn: &Connection, user: &User) -> Result<()> {
 fn upsert_post_tx(tx: &Transaction, post: &Post, fetch_run_id: Option<&str>) -> Result<()> {
     let now = Utc::now().to_rfc3339();
 
+    // Read-merge-write: never lose richer stored data to a sparser re-fetch.
+    // We only merge when the incoming post looks sparse — specifically when its
+    // author is a `@username` sentinel (set by the provider when no numeric id
+    // is available). A non-sentinel author means this is an intentional update
+    // (the caller has full data), so we skip the merge and let the upsert
+    // overwrite normally.
+    let post_owned: Post;
+    let post = if post.author.as_str().starts_with('@') {
+        if let Some(existing) = load_post(tx, post.id.as_str())? {
+            post_owned = Post::merge(existing, post.clone());
+            &post_owned
+        } else {
+            post
+        }
+    } else {
+        post
+    };
+
     // Ensure the author stub exists so the FK is satisfied.
     tx.execute(
         "INSERT INTO users (id, username, name, biography, profile_picture_url, updated_at)
