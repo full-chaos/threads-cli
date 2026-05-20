@@ -218,11 +218,13 @@ pub(crate) fn envelope_to_page(env: Envelope<PostDto>, root_hint: Option<&PostId
 pub(crate) fn dto_to_post(dto: PostDto, root_hint: Option<&PostId>) -> Post {
     let raw = serde_json::to_value(&dto).ok();
     let created_at = dto.timestamp.as_deref().and_then(parse_timestamp);
+    // `@`-prefix marks a synthesized/sparse author (no `owner` in the DTO).
+    // Callers can detect it via `starts_with('@')` and resolve later.
     let author = dto
         .owner
         .as_ref()
         .map(|o| UserId::new(&o.id))
-        .or_else(|| dto.username.as_deref().map(UserId::new))
+        .or_else(|| dto.username.as_deref().map(|u| UserId::new(format!("@{u}"))))
         .unwrap_or_else(|| UserId::new(""));
     let parent_id = dto.replied_to.as_ref().map(|r| PostId::new(&r.id));
     let root_id = dto
@@ -331,7 +333,7 @@ mod tests {
         };
         let post = dto_to_post(dto, None);
         assert_eq!(post.id, PostId::new("p1"));
-        assert_eq!(post.author, UserId::new("alice"));
+        assert_eq!(post.author, UserId::new("@alice"));
     }
 
     #[test]
