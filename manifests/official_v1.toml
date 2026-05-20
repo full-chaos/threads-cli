@@ -149,3 +149,34 @@ fields = [
     "is_reply",
     "hide_status",
 ]
+
+[[actions]]
+name = "post/create"
+path = "/v1.0/me/threads"
+method = "POST"
+permission = "threads_content_publish"
+documented = true
+# Rate limit: 250 published posts per 24h per account (Meta-enforced).
+rate_limit_per_day = 250
+
+[[actions]]
+name = "post/publish"
+path = "/v1.0/me/threads_publish"
+method = "POST"
+permission = "threads_content_publish"
+documented = true
+# No separate limit — publishing consumes the create quota.
+
+[[objects]]
+name = "container"
+path = "/v1.0/{container-id}"
+method = "GET"
+permission = "threads_content_publish"
+fields = ["status"]
+
+[[objects]]
+name = "publishing_limit"
+path = "/v1.0/me/threads_publishing_limit"
+method = "GET"
+permission = "threads_content_publish"
+fields = ["quota_usage", "config", "reply_quota_usage", "reply_config"]

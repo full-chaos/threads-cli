@@ -117,6 +117,10 @@ impl Manifest {
         self.edges.iter().find(|e| e.name == name)
     }
 
+    pub fn action(&self, name: &str) -> Option<&Action> {
+        self.actions.iter().find(|a| a.name == name)
+    }
+
     fn validate(&self) -> Result<()> {
         if self.api.base_url.is_empty() {
             return Err(ManifestError::Invalid("api.base_url is empty".into()));
@@ -205,6 +209,32 @@ version = "v1.0"
             m.edge("me/threads").is_some(),
             "manifest must define `me/threads` edge"
         );
+    }
+
+    #[test]
+    fn official_manifest_has_publish_actions_and_objects() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../manifests/official_v1.toml");
+        let m = Manifest::from_path(path).expect("manifest should parse");
+
+        let create = m.action("post/create").expect("post/create action missing");
+        assert_eq!(create.method, "POST");
+        assert_eq!(create.path, "/v1.0/me/threads");
+        assert_eq!(create.permission, "threads_content_publish");
+        assert_eq!(create.rate_limit_per_day, Some(250));
+
+        let publish = m.action("post/publish").expect("post/publish action missing");
+        assert_eq!(publish.method, "POST");
+        assert_eq!(publish.path, "/v1.0/me/threads_publish");
+        assert_eq!(publish.permission, "threads_content_publish");
+
+        let container = m.object("container").expect("container object missing");
+        assert_eq!(container.path, "/v1.0/{container-id}");
+        assert!(container.fields.contains(&"status".to_string()));
+
+        let limits = m.object("publishing_limit").expect("publishing_limit object missing");
+        assert_eq!(limits.path, "/v1.0/me/threads_publishing_limit");
+        assert!(limits.fields.iter().any(|f| f == "quota_usage"));
+        assert!(limits.fields.iter().any(|f| f == "reply_quota_usage"));
     }
 
     #[test]
