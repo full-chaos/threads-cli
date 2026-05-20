@@ -151,6 +151,6 @@ mod tests {
         assert!(matches!(p.publishing_limits().await, Err(crate::Error::NotSupported(_))));
         assert!(matches!(p.fetch_post(&pid).await, Err(crate::Error::NotSupported(_))));
         assert!(matches!(p.create_carousel_item(&item).await, Err(crate::Error::NotSupported(_))));
-        assert!(matches!(p.create_carousel_container(&req, &[cid.clone()]).await, Err(crate::Error::NotSupported(_))));
+        assert!(matches!(p.create_carousel_container(&req, std::slice::from_ref(&cid)).await, Err(crate::Error::NotSupported(_))));
     }
 }
