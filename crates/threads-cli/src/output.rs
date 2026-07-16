@@ -3,6 +3,14 @@ use std::io::Write;
 use anyhow::Result;
 use threads_core::{Post, User};
 
+#[allow(dead_code)] // T9 consumes the renderer APIs without changing command wiring here.
+#[path = "output/audience.rs"]
+mod audience;
+#[allow(unused_imports)] // T9 imports these stable presentation APIs from `output`.
+pub use audience::{
+    AudienceReport, AudienceReportError, render_audience_report, render_engaged_accounts,
+};
+
 #[derive(Copy, Clone, Debug)]
 pub enum OutputFormat {
     Human,
@@ -109,6 +117,7 @@ mod tests {
         Post {
             id: PostId::new("1"),
             author: UserId::new("u1"),
+            author_username: Some("u1".into()),
             text: Some("Hello world".into()),
             created_at: None,
             parent_id: None,
@@ -159,3 +168,7 @@ mod tests {
         assert!(s.contains("Hello world"));
     }
 }
+
+#[cfg(test)]
+#[path = "output/audience_tests.rs"]
+mod audience_tests;
