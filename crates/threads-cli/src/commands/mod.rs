@@ -13,8 +13,10 @@ use crate::{
 };
 
 pub mod auth;
+pub mod browser;
 pub mod delete;
 pub mod export;
+pub mod follow;
 pub mod ingest;
 pub mod init;
 pub mod post;
@@ -30,6 +32,7 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Init(args) => init::run(args, cli.config.as_deref()),
         Command::Auth(cmd) => auth::run(cmd, cli.config.as_deref()).await,
+        Command::Follow(args) => follow::run(args),
         Command::Ingest(cmd) => ingest::run(cmd, cli.config.as_deref(), cli.db.as_deref()).await,
         Command::Show(args) => show::run(
             args,
@@ -103,4 +106,27 @@ pub fn provider_config(cfg: &CliConfig) -> Result<ProviderConfig> {
             .unwrap_or_else(|| "http://127.0.0.1:0/callback".to_string()),
         access_token: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::cli::{FollowArgs, OutputFormatArg};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn follow_dispatch_requires_no_config_token_provider_or_store() {
+        let cli = Cli {
+            config: None,
+            db: None,
+            verbose: 0,
+            format: OutputFormatArg::Human,
+            command: Command::Follow(FollowArgs {
+                username: "threads".to_string(),
+                no_open: true,
+            }),
+        };
+
+        assert!(dispatch(cli).await.is_ok());
+    }
 }

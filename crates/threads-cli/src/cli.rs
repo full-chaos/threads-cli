@@ -57,6 +57,9 @@ pub enum Command {
     #[command(subcommand)]
     Auth(AuthCommand),
 
+    /// Open the official Threads follow intent for a username.
+    Follow(FollowArgs),
+
     /// Ingest records from the provider into the local store.
     #[command(subcommand)]
     Ingest(IngestCommand),
@@ -85,6 +88,16 @@ pub struct InitArgs {
     /// Overwrite an existing config file.
     #[arg(long)]
     pub force: bool,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct FollowArgs {
+    /// Threads username to follow (with or without a leading @).
+    pub username: String,
+
+    /// Print the follow URL without opening a browser.
+    #[arg(long)]
+    pub no_open: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -230,6 +243,45 @@ mod tests {
     #[test]
     fn cli_structure_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn root_help_describes_existing_auth_command() {
+        let help = Cli::command().render_long_help().to_string();
+
+        assert!(help.contains("auth    Authentication subcommands"));
+    }
+
+    #[test]
+    fn follow_args_parse_plain_handle_with_no_open() {
+        use clap::Parser;
+
+        let cli = Cli::try_parse_from(["threads-cli", "follow", "threads", "--no-open"])
+            .expect("follow command should parse");
+
+        match cli.command {
+            Command::Follow(args) => {
+                assert_eq!(args.username, "threads");
+                assert!(args.no_open);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn follow_args_parse_at_prefixed_handle() {
+        use clap::Parser;
+
+        let cli = Cli::try_parse_from(["threads-cli", "follow", "@threads"])
+            .expect("follow command should parse");
+
+        match cli.command {
+            Command::Follow(args) => {
+                assert_eq!(args.username, "@threads");
+                assert!(!args.no_open);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
     }
 
     #[test]

@@ -81,9 +81,9 @@ async fn login_local_listener(
     println!("Opening browser to authorize threads-cli...");
     println!("If it does not open, visit this URL manually:");
     println!("  {url}");
-    let _ = std::process::Command::new("open")
-        .arg(url.as_str())
-        .status();
+    if let Err(error) = super::browser::open(url.as_str()) {
+        eprintln!("could not open browser ({error}); visit the URL above manually");
+    }
 
     let code = server
         .accept_code(state)
@@ -111,9 +111,9 @@ async fn login_manual_paste(
          address bar and paste it here. (State to match: {state})\n"
     );
 
-    let _ = std::process::Command::new("open")
-        .arg(url.as_str())
-        .status();
+    if let Err(error) = super::browser::open(url.as_str()) {
+        eprintln!("could not open browser ({error}); visit the URL above manually");
+    }
 
     print!("Paste URL or code: ");
     io::stdout().flush()?;
