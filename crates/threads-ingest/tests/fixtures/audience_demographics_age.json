@@ -1,0 +1,21 @@
+{
+  "data": [
+    {
+      "name": "follower_demographics",
+      "period": "lifetime",
+      "total_value": 1234,
+      "breakdowns": [
+        {
+          "dimension_keys": ["age"],
+          "results": [
+            { "dimension_values": ["25-34"], "value": 620 },
+            { "dimension_values": ["35-44"], "value": 410 }
+          ]
+        }
+      ],
+      "title": "Follower demographics",
+      "description": "Follower demographics grouped by age.",
+      "id": "17841400000000000/insights/follower_demographics/lifetime"
+    }
+  ]
+}

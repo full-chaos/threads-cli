@@ -212,8 +212,137 @@ version = "v1.0"
     }
 
     #[test]
+    fn official_manifest_contains_no_follower_or_follow_actions() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../manifests/official_v1.toml"
+        );
+        let manifest = Manifest::from_path(path).expect("manifest should parse");
+
+        assert!(
+            manifest
+                .actions
+                .iter()
+                .all(|action| !action.name.contains("follower") && !action.name.contains("follow")),
+            "official manifest must not define follower or follow actions"
+        );
+    }
+
+    #[test]
+    fn official_manifest_defines_audience_insights_and_mentions_contracts() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../manifests/official_v1.toml"
+        );
+        let manifest = Manifest::from_path(path).expect("manifest should parse");
+
+        let insights = manifest
+            .object("user/insights")
+            .expect("user/insights object missing");
+        assert_eq!(insights.method, "GET");
+        assert_eq!(insights.path, "/{threads-user-id}/threads_insights");
+        assert_eq!(
+            insights.permission.as_deref(),
+            Some("threads_manage_insights")
+        );
+        assert_eq!(
+            insights.fields,
+            ["followers_count", "follower_demographics"]
+        );
+
+        let mentions = manifest
+            .edge("user/mentions")
+            .expect("user/mentions edge missing");
+        assert_eq!(mentions.method, "GET");
+        assert_eq!(mentions.path, "/{threads-user-id}/mentions");
+        assert_eq!(
+            mentions.permission.as_deref(),
+            Some("threads_manage_mentions")
+        );
+        assert!(mentions.paginated);
+        println!(
+            "insights: name={}, path={}, permission={}; mentions: name={}, path={}, permission={}, paginated={}",
+            insights.name,
+            insights.path,
+            insights.permission.as_deref().unwrap_or("none"),
+            mentions.name,
+            mentions.path,
+            mentions.permission.as_deref().unwrap_or("none"),
+            mentions.paginated,
+        );
+        assert_eq!(
+            mentions.fields,
+            [
+                "id",
+                "media_product_type",
+                "media_type",
+                "media_url",
+                "permalink",
+                "owner",
+                "username",
+                "text",
+                "timestamp",
+                "shortcode",
+                "thumbnail_url",
+                "children",
+                "is_quote_post",
+            ]
+        );
+    }
+
+    #[test]
+    fn audience_fixtures_cover_required_envelopes_and_pagination() {
+        const FIXTURES: [(&str, &str); 8] = [
+            ("audience_followers_count.json", "\"followers_count\""),
+            ("audience_demographics_country.json", "\"country\""),
+            ("audience_demographics_city.json", "\"city\""),
+            ("audience_demographics_age.json", "\"age\""),
+            ("audience_demographics_gender.json", "\"gender\""),
+            ("audience_empty_data.json", "\"data\": []"),
+            ("mentions_page.json", "\"after\": \"QVFIUnhR\""),
+            ("mentions_terminal_page.json", "\"after\": null"),
+        ];
+        let fixtures_directory = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../threads-ingest/tests/fixtures"
+        );
+
+        for (file_name, required_fragment) in FIXTURES {
+            let fixture = fs::read_to_string(format!("{fixtures_directory}/{file_name}"))
+                .expect("audience fixture should exist");
+            assert!(
+                fixture.contains("\"data\""),
+                "{file_name} must envelope data"
+            );
+            assert!(
+                fixture.contains(required_fragment),
+                "{file_name} missing required contract fragment"
+            );
+        }
+
+        for file_name in ["audience_401.json", "audience_403.json"] {
+            let fixture = fs::read_to_string(format!("{fixtures_directory}/{file_name}"))
+                .expect("audience error fixture should exist");
+            assert!(
+                fixture.contains("\"error\""),
+                "{file_name} must envelope error"
+            );
+        }
+
+        let malformed = fs::read_to_string(format!("{fixtures_directory}/audience_malformed.json"))
+            .expect("malformed audience fixture should exist");
+        assert!(
+            !malformed.contains("\"data\""),
+            "malformed fixture must omit the required data envelope"
+        );
+    }
+
+    #[test]
     fn official_manifest_has_publish_actions_and_objects() {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../manifests/official_v1.toml");
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../manifests/official_v1.toml"
+        );
         let m = Manifest::from_path(path).expect("manifest should parse");
 
         let create = m.action("post/create").expect("post/create action missing");
@@ -222,7 +351,9 @@ version = "v1.0"
         assert_eq!(create.permission, "threads_content_publish");
         assert_eq!(create.rate_limit_per_day, Some(250));
 
-        let publish = m.action("post/publish").expect("post/publish action missing");
+        let publish = m
+            .action("post/publish")
+            .expect("post/publish action missing");
         assert_eq!(publish.method, "POST");
         assert_eq!(publish.path, "/v1.0/me/threads_publish");
         assert_eq!(publish.permission, "threads_content_publish");
@@ -231,7 +362,9 @@ version = "v1.0"
         assert_eq!(container.path, "/v1.0/{container-id}");
         assert!(container.fields.contains(&"status".to_string()));
 
-        let limits = m.object("publishing_limit").expect("publishing_limit object missing");
+        let limits = m
+            .object("publishing_limit")
+            .expect("publishing_limit object missing");
         assert_eq!(limits.path, "/v1.0/me/threads_publishing_limit");
         assert!(limits.fields.iter().any(|f| f == "quota_usage"));
         assert!(limits.fields.iter().any(|f| f == "reply_quota_usage"));

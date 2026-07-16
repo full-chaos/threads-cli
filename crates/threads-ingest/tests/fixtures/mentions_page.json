@@ -1,0 +1,25 @@
+{
+  "data": [
+    {
+      "id": "17895695668004550",
+      "media_product_type": "THREADS",
+      "media_type": "TEXT_POST",
+      "media_url": "https://cdn.example.invalid/mention.jpg",
+      "permalink": "https://www.threads.net/@author/post/ABC123",
+      "owner": { "id": "17841400000000001" },
+      "username": "author",
+      "text": "Mentioning @account",
+      "timestamp": "2026-07-16T12:00:00+0000",
+      "shortcode": "ABC123",
+      "thumbnail_url": "https://cdn.example.invalid/mention-thumb.jpg",
+      "children": { "data": [] },
+      "is_quote_post": false
+    }
+  ],
+  "paging": {
+    "cursors": {
+      "before": "QVFIUjY2",
+      "after": "QVFIUnhR"
+    }
+  }
+}

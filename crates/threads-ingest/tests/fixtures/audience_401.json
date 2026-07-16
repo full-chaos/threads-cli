@@ -1,0 +1,8 @@
+{
+  "error": {
+    "message": "Invalid OAuth 2.0 Access Token",
+    "type": "OAuthException",
+    "code": 190,
+    "fbtrace_id": "A1B2C3D4"
+  }
+}
