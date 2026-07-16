@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{num::NonZeroUsize, path::PathBuf};
 
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 
@@ -60,6 +60,10 @@ pub enum Command {
     /// Open the official Threads follow intent for a username.
     Follow(FollowArgs),
 
+    /// Refresh and inspect locally observed audience data.
+    #[command(subcommand)]
+    Audience(AudienceCommand),
+
     /// Ingest records from the provider into the local store.
     #[command(subcommand)]
     Ingest(IngestCommand),
@@ -98,6 +102,52 @@ pub struct FollowArgs {
     /// Print the follow URL without opening a browser.
     #[arg(long)]
     pub no_open: bool,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AudienceCommand {
+    /// Fetch the authenticated account's audience observations from Threads.
+    Refresh,
+    /// Show locally stored audience observation history.
+    Show(AudienceShowArgs),
+    /// Rank accounts by observed replies and mentions in local data.
+    Engaged(AudienceEngagedArgs),
+    /// Remove locally stored audience observations before a cutoff.
+    Purge(AudiencePurgeArgs),
+}
+
+#[derive(Debug, clap::Args)]
+pub struct AudienceShowArgs {
+    /// Number of observations to show.
+    #[arg(long, default_value = "10")]
+    pub history: NonZeroUsize,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct AudienceEngagedArgs {
+    /// Number of observed accounts to show.
+    #[arg(long, default_value = "20")]
+    pub limit: NonZeroUsize,
+    /// Rank by total observed engagement, replies, or mentions.
+    #[arg(long, value_enum, default_value_t = AudienceSortArg::Total)]
+    pub sort: AudienceSortArg,
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+pub enum AudienceSortArg {
+    Total,
+    Replies,
+    Mentions,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct AudiencePurgeArgs {
+    /// Purge observations before this RFC 3339 timestamp or YYYY-MM-DD date.
+    #[arg(long)]
+    pub before: String,
+    /// Actually remove matching observations. Without this flag, prints a dry-run count.
+    #[arg(long)]
+    pub apply: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -249,7 +299,53 @@ mod tests {
     fn root_help_describes_existing_auth_command() {
         let help = Cli::command().render_long_help().to_string();
 
-        assert!(help.contains("auth    Authentication subcommands"));
+        assert!(help.contains("auth"));
+        assert!(help.contains("Authentication subcommands"));
+    }
+
+    #[test]
+    fn audience_commands_are_exposed_in_help_and_parse() {
+        use clap::Parser;
+
+        let help = Cli::command().render_long_help().to_string();
+
+        assert!(help.contains("audience"));
+        assert!(Cli::try_parse_from(["threads-cli", "audience", "refresh"]).is_ok());
+        assert!(Cli::try_parse_from(["threads-cli", "audience", "show"]).is_ok());
+        assert!(Cli::try_parse_from(["threads-cli", "audience", "engaged"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["threads-cli", "audience", "purge", "--before", "2026-01-01"])
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn audience_defaults_and_zero_boundaries_parse_as_documented() {
+        use clap::Parser;
+
+        let show = Cli::try_parse_from(["threads-cli", "audience", "show"])
+            .expect("audience show should parse");
+        let engaged = Cli::try_parse_from(["threads-cli", "audience", "engaged"])
+            .expect("audience engaged should parse");
+
+        match show.command {
+            Command::Audience(AudienceCommand::Show(args)) => assert_eq!(args.history.get(), 10),
+            other => panic!("unexpected command: {other:?}"),
+        }
+        match engaged.command {
+            Command::Audience(AudienceCommand::Engaged(args)) => {
+                assert_eq!(args.limit.get(), 20);
+                assert!(matches!(args.sort, AudienceSortArg::Total));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        assert!(
+            Cli::try_parse_from(["threads-cli", "audience", "show", "--history", "0"]).is_err()
+        );
+        assert!(
+            Cli::try_parse_from(["threads-cli", "audience", "engaged", "--limit", "0"]).is_err()
+        );
     }
 
     #[test]

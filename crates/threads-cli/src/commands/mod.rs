@@ -14,6 +14,7 @@ use crate::{
     config::CliConfig,
 };
 
+pub mod audience;
 pub mod auth;
 pub mod browser;
 pub mod delete;
@@ -35,6 +36,15 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
         Command::Init(args) => init::run(args, cli.config.as_deref()),
         Command::Auth(cmd) => auth::run(cmd, cli.config.as_deref()).await,
         Command::Follow(args) => follow::run(args),
+        Command::Audience(cmd) => {
+            audience::run(
+                cmd,
+                cli.config.as_deref(),
+                cli.db.as_deref(),
+                cli.format.into(),
+            )
+            .await
+        }
         Command::Ingest(cmd) => ingest::run(cmd, cli.config.as_deref(), cli.db.as_deref()).await,
         Command::Show(args) => show::run(
             args,

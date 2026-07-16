@@ -202,7 +202,22 @@ impl<P: Provider + 'static, S: StoreWrite + 'static> Ingestor<P, S> {
     }
 
     pub async fn refresh_audience(&self) -> Result<AudienceRefreshSummary> {
+        self.refresh_audience_for_account(None).await
+    }
+
+    pub async fn refresh_audience_for_account(
+        &self,
+        expected_account_id: Option<&UserId>,
+    ) -> Result<AudienceRefreshSummary> {
         let account = self.provider.fetch_me().await?;
+        if let Some(expected_account_id) = expected_account_id {
+            if account.id != *expected_account_id {
+                return Err(Error::Auth(format!(
+                    "stored token is bound to account {expected_account_id}, but Threads authenticated account is {}; run `threads-cli auth login`",
+                    account.id
+                )));
+            }
+        }
         self.store.upsert_user(&account)?;
         if let Some(username) = &account.username {
             self.store.resolve_author(username, &account.id)?;

@@ -1010,6 +1010,30 @@ async fn refresh_audience_writes_count_only_below_demographic_threshold() {
 }
 
 #[tokio::test]
+async fn refresh_audience_rejects_a_token_account_mismatch_before_any_store_write() {
+    // Given: a provider authenticated as a different account than the token metadata.
+    let provider = Arc::new(
+        MockProvider::new(vec![])
+            .with_me(audience_account())
+            .with_audience(audience_with_all_breakdowns(99)),
+    );
+    let store = MockStore::new();
+    let ingestor = Ingestor::new(provider, Box::new(NoopNormalizer), Arc::clone(&store));
+    let expected_account_id = UserId::new("different-account");
+
+    // When: a bound audience refresh starts.
+    let result = ingestor
+        .refresh_audience_for_account(Some(&expected_account_id))
+        .await;
+
+    // Then: it fails before persisting account or audience data.
+    assert!(matches!(result, Err(Error::Auth(_))));
+    let state = store.state.lock().unwrap();
+    assert!(state.upserted_users.is_empty());
+    assert!(state.audience_snapshots.is_empty());
+}
+
+#[tokio::test]
 async fn refresh_audience_persists_all_breakdowns_in_one_snapshot() {
     // Given: an eligible account and one bucket for every required breakdown.
     let provider = Arc::new(
