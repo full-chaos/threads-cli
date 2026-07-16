@@ -8,7 +8,10 @@
 use std::{collections::HashSet, sync::Arc};
 
 use chrono::Utc;
-use threads_core::{Cursor, FetchRun, PostId, Provider, Result};
+use threads_core::{
+    AudienceInsightQuery, AudienceInsightResult, AudienceSnapshot, Cursor, DemographicBucket,
+    DemographicDimension, Error, FetchRun, Mention, PostId, Provider, Result, User, UserId,
+};
 use tracing::info;
 use uuid::Uuid;
 
@@ -16,6 +19,29 @@ use crate::{normalizer::Normalizer, store_shim::StoreWrite};
 
 /// Maximum posts to upsert in a single `StoreWrite::upsert_posts` call.
 const BATCH_SIZE: usize = 100;
+const MENTION_PAGE_SIZE: usize = 100;
+const DEMOGRAPHIC_DIMENSIONS: [DemographicDimension; 4] = [
+    DemographicDimension::Country,
+    DemographicDimension::City,
+    DemographicDimension::Age,
+    DemographicDimension::Gender,
+];
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MentionIngestWarning {
+    MissingAuthenticatedUsername,
+    PermissionDenied(String),
+    ApiFailure(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AudienceRefreshSummary {
+    pub account_id: UserId,
+    pub followers_count: u64,
+    pub demographics_count: usize,
+    pub mentions_ingested: u64,
+    pub mention_warning: Option<MentionIngestWarning>,
+}
 
 /// Drives the full `provider → normalizer → store` pipeline.
 pub struct Ingestor<P: Provider + 'static, S: StoreWrite + 'static> {
@@ -175,6 +201,35 @@ impl<P: Provider + 'static, S: StoreWrite + 'static> Ingestor<P, S> {
         }
     }
 
+    pub async fn refresh_audience(&self) -> Result<AudienceRefreshSummary> {
+        let account = self.provider.fetch_me().await?;
+        self.store.upsert_user(&account)?;
+        if let Some(username) = &account.username {
+            self.store.resolve_author(username, &account.id)?;
+        }
+
+        let followers_count = self.fetch_followers_count(&account.id).await?;
+        let demographics = self
+            .fetch_demographics(&account.id, followers_count)
+            .await?;
+        let snapshot = AudienceSnapshot {
+            account_id: account.id.clone(),
+            observed_at: Utc::now(),
+            followers_count,
+            demographics,
+        };
+        self.store.upsert_audience_snapshot(&snapshot, None)?;
+
+        let (mentions_ingested, mention_warning) = self.ingest_mentions(&account).await?;
+        Ok(AudienceRefreshSummary {
+            account_id: account.id,
+            followers_count,
+            demographics_count: snapshot.demographics.len(),
+            mentions_ingested,
+            mention_warning,
+        })
+    }
+
     // --- private helpers ---
 
     async fn run_ingest_me(&self, run_id: &str) -> Result<u64> {
@@ -245,6 +300,105 @@ impl<P: Provider + 'static, S: StoreWrite + 'static> Ingestor<P, S> {
         }
 
         Ok(total)
+    }
+
+    async fn fetch_followers_count(&self, account_id: &UserId) -> Result<u64> {
+        match self
+            .provider
+            .fetch_audience_insight(account_id, AudienceInsightQuery::FollowersCount)
+            .await?
+        {
+            AudienceInsightResult::FollowersCount(value) => Ok(value),
+            AudienceInsightResult::Demographics(_) => Err(Error::Parse(
+                "followers_count request returned demographics".into(),
+            )),
+        }
+    }
+
+    async fn fetch_demographics(
+        &self,
+        account_id: &UserId,
+        followers_count: u64,
+    ) -> Result<Vec<DemographicBucket>> {
+        if followers_count < 100 {
+            return Ok(vec![]);
+        }
+
+        let mut demographics = Vec::new();
+        for dimension in DEMOGRAPHIC_DIMENSIONS {
+            match self
+                .provider
+                .fetch_audience_insight(
+                    account_id,
+                    AudienceInsightQuery::FollowerDemographics(dimension),
+                )
+                .await?
+            {
+                AudienceInsightResult::Demographics(snapshot) => {
+                    demographics.extend(snapshot.demographics);
+                }
+                AudienceInsightResult::FollowersCount(_) => {
+                    return Err(Error::Parse(format!(
+                        "{dimension:?} demographics request returned followers_count"
+                    )));
+                }
+            }
+        }
+        Ok(demographics)
+    }
+
+    async fn ingest_mentions(&self, account: &User) -> Result<(u64, Option<MentionIngestWarning>)> {
+        let Some(username) = account.username.as_deref() else {
+            return Ok((0, Some(MentionIngestWarning::MissingAuthenticatedUsername)));
+        };
+
+        let mention = Mention {
+            username: username.into(),
+            user_id: Some(account.id.clone()),
+        };
+        let mut seen_posts = HashSet::new();
+        let mut seen_cursors = HashSet::new();
+        let mut cursor = None;
+        let mut mentions_ingested = 0;
+
+        loop {
+            let page = match self
+                .provider
+                .fetch_mentions(&account.id, cursor, MENTION_PAGE_SIZE)
+                .await
+            {
+                Ok(page) => page,
+                Err(error) => return Ok((mentions_ingested, Some(Self::mention_warning(error)))),
+            };
+
+            let mut posts = Vec::new();
+            for mut post in page.items {
+                if seen_posts.insert(post.id.clone()) {
+                    if !post.mentions.iter().any(|existing| existing == &mention) {
+                        post.mentions.push(mention.clone());
+                    }
+                    posts.push(post);
+                }
+            }
+            if !posts.is_empty() {
+                mentions_ingested += self.store.upsert_posts(&posts, None)? as u64;
+            }
+
+            let Some(next) = page.next else {
+                return Ok((mentions_ingested, None));
+            };
+            if !seen_cursors.insert(next.0.clone()) {
+                return Ok((mentions_ingested, None));
+            }
+            cursor = Some(next);
+        }
+    }
+
+    fn mention_warning(error: Error) -> MentionIngestWarning {
+        match error {
+            Error::PermissionDenied(message) => MentionIngestWarning::PermissionDenied(message),
+            other => MentionIngestWarning::ApiFailure(other.to_string()),
+        }
     }
 
     async fn run_ingest_engagement(&self, run_id: &str, max_depth: u32) -> Result<u64> {

@@ -209,6 +209,11 @@ impl Normalizer for OfficialNormalizer {
             .and_then(|v| v.as_str())
             .ok_or(NormalizeError::MissingField("id"))?;
 
+        let author_username = obj
+            .get("username")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+
         // Author: prefer owner.id; fall back to synthesizing from username.
         let author = if let Some(owner_id) = obj
             .get("owner")
@@ -216,7 +221,7 @@ impl Normalizer for OfficialNormalizer {
             .and_then(|v| v.as_str())
         {
             UserId::new(owner_id)
-        } else if let Some(username) = obj.get("username").and_then(|v| v.as_str()) {
+        } else if let Some(username) = author_username.as_deref() {
             UserId::new(format!("@{username}"))
         } else {
             return Err(NormalizeError::MissingField("owner.id or username"));
@@ -253,6 +258,7 @@ impl Normalizer for OfficialNormalizer {
         Ok(Post {
             id: PostId::new(id),
             author,
+            author_username,
             text: obj.get("text").and_then(|v| v.as_str()).map(String::from),
             created_at,
             parent_id,

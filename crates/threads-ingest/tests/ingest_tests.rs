@@ -5,7 +5,10 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde_json::json;
-use threads_core::{Cursor, FetchRun, Page, Post, PostId, Result, User, UserId};
+use threads_core::{
+    AudienceInsightQuery, AudienceInsightResult, AudienceSnapshot, Cursor, DemographicBucket,
+    DemographicDimension, Error, FetchRun, Mention, Page, Post, PostId, Result, User, UserId,
+};
 use threads_ingest::{Ingestor, NormalizeError, Normalizer, OfficialNormalizer, StoreWrite};
 
 // ---------- Fixtures (loaded from files) ----------
@@ -176,6 +179,7 @@ fn normalize_post_synthesizes_author_from_username() {
     let norm = OfficialNormalizer;
     let post = norm.normalize_post(&raw, None).expect("normalize_post");
     assert_eq!(post.author, UserId::new("@fallback_user"));
+    assert_eq!(post.author_username.as_deref(), Some("fallback_user"));
 }
 
 // =============================================================================
@@ -193,6 +197,22 @@ struct MockProvider {
     replies: std::collections::HashMap<PostId, Vec<Post>>,
     /// Value returned from `fetch_me`.
     me: User,
+    audience: Option<MockAudience>,
+    audience_queries: Mutex<Vec<AudienceInsightQuery>>,
+    mention_page: Option<Page<Post>>,
+    mention_error: Option<MockProviderError>,
+    mention_requests: Mutex<Vec<Option<Cursor>>>,
+}
+
+struct MockAudience {
+    followers_count: u64,
+    demographics: Vec<DemographicBucket>,
+    fail_dimension: Option<DemographicDimension>,
+}
+
+#[derive(Clone, Copy)]
+enum MockProviderError {
+    PermissionDenied,
 }
 
 impl MockProvider {
@@ -208,6 +228,11 @@ impl MockProvider {
                 biography: None,
                 profile_picture_url: None,
             },
+            audience: None,
+            audience_queries: Mutex::new(vec![]),
+            mention_page: None,
+            mention_error: None,
+            mention_requests: Mutex::new(vec![]),
         }
     }
 
@@ -226,10 +251,26 @@ impl MockProvider {
         self
     }
 
+    fn with_audience(mut self, audience: MockAudience) -> Self {
+        self.audience = Some(audience);
+        self
+    }
+
+    fn with_mentions(mut self, page: Page<Post>) -> Self {
+        self.mention_page = Some(page);
+        self
+    }
+
+    fn with_mention_error(mut self, error: MockProviderError) -> Self {
+        self.mention_error = Some(error);
+        self
+    }
+
     fn make_post(id: &str, author: &str) -> Post {
         Post {
             id: PostId::new(id),
             author: UserId::new(author),
+            author_username: None,
             text: Some(format!("text of {id}")),
             created_at: None,
             parent_id: None,
@@ -282,6 +323,56 @@ impl threads_core::Provider for MockProvider {
     async fn fetch_thread(&self, _root_id: &PostId) -> Result<Vec<Post>> {
         Ok(self.thread_posts.clone())
     }
+
+    async fn fetch_audience_insight(
+        &self,
+        user_id: &UserId,
+        query: AudienceInsightQuery,
+    ) -> Result<AudienceInsightResult> {
+        self.audience_queries.lock().unwrap().push(query.clone());
+        let audience = self
+            .audience
+            .as_ref()
+            .ok_or_else(|| Error::NotSupported("mock audience".into()))?;
+        match query {
+            AudienceInsightQuery::FollowersCount => Ok(AudienceInsightResult::FollowersCount(
+                audience.followers_count,
+            )),
+            AudienceInsightQuery::FollowerDemographics(dimension) => {
+                if audience.fail_dimension == Some(dimension) {
+                    return Err(Error::Parse(format!("{dimension:?} unavailable")));
+                }
+                Ok(AudienceInsightResult::Demographics(AudienceSnapshot {
+                    account_id: user_id.clone(),
+                    observed_at: Utc::now(),
+                    followers_count: audience.followers_count,
+                    demographics: audience
+                        .demographics
+                        .iter()
+                        .filter(|bucket| bucket.dimension == dimension)
+                        .cloned()
+                        .collect(),
+                }))
+            }
+        }
+    }
+
+    async fn fetch_mentions(
+        &self,
+        _user_id: &UserId,
+        cursor: Option<Cursor>,
+        _limit: usize,
+    ) -> Result<Page<Post>> {
+        self.mention_requests.lock().unwrap().push(cursor);
+        if let Some(error) = self.mention_error {
+            return match error {
+                MockProviderError::PermissionDenied => {
+                    Err(Error::PermissionDenied("threads_manage_mentions".into()))
+                }
+            };
+        }
+        Ok(self.mention_page.clone().unwrap_or_else(Page::empty))
+    }
 }
 
 /// State captured by MockStore.
@@ -292,6 +383,7 @@ struct MockStoreState {
     run_ended: Vec<(String, u64, Option<String>)>,
     upserted_users: Vec<User>,
     resolve_author_calls: Vec<(String, UserId)>,
+    audience_snapshots: Vec<AudienceSnapshot>,
 }
 
 struct MockStore {
@@ -311,6 +403,53 @@ impl StoreWrite for MockStore {
         let mut s = self.state.lock().unwrap();
         s.upserted.extend_from_slice(posts);
         Ok(posts.len())
+    }
+
+    fn upsert_audience_snapshot(
+        &self,
+        snapshot: &AudienceSnapshot,
+        _fetch_run_id: Option<&str>,
+    ) -> Result<()> {
+        let mut s = self.state.lock().unwrap();
+        s.audience_snapshots.push(snapshot.clone());
+        Ok(())
+    }
+
+    fn audience_history(&self, account_id: &UserId, limit: usize) -> Result<Vec<AudienceSnapshot>> {
+        let state = self.state.lock().unwrap();
+        Ok(state
+            .audience_snapshots
+            .iter()
+            .filter(|snapshot| &snapshot.account_id == account_id)
+            .take(limit)
+            .cloned()
+            .collect())
+    }
+
+    fn count_audience_snapshots_before(
+        &self,
+        account_id: &UserId,
+        before: DateTime<Utc>,
+    ) -> Result<u64> {
+        let state = self.state.lock().unwrap();
+        Ok(state
+            .audience_snapshots
+            .iter()
+            .filter(|snapshot| &snapshot.account_id == account_id && snapshot.observed_at < before)
+            .count() as u64)
+    }
+
+    fn delete_audience_snapshots_before(
+        &self,
+        account_id: &UserId,
+        before: DateTime<Utc>,
+    ) -> Result<u64> {
+        let mut state = self.state.lock().unwrap();
+        let previous_len = state.audience_snapshots.len();
+        state.audience_snapshots.retain(|snapshot| {
+            &snapshot.account_id != account_id || snapshot.observed_at >= before
+        });
+        Ok((previous_len - state.audience_snapshots.len()) as u64)
     }
 
     fn record_fetch_run_start(&self, run: &FetchRun) -> Result<()> {
@@ -354,7 +493,8 @@ impl StoreWrite for MockStore {
 
     fn resolve_author(&self, username: &str, real_id: &UserId) -> Result<()> {
         let mut s = self.state.lock().unwrap();
-        s.resolve_author_calls.push((username.to_string(), real_id.clone()));
+        s.resolve_author_calls
+            .push((username.to_string(), real_id.clone()));
         Ok(())
     }
 }
@@ -713,6 +853,7 @@ async fn ingest_engagement_upserts_me_profile() {
     let my_post = Post {
         id: PostId::new("my_post_e"),
         author: UserId::new("real_id_42"),
+        author_username: Some("alice".into()),
         text: Some("seed".into()),
         created_at: None,
         parent_id: None,
@@ -726,14 +867,24 @@ async fn ingest_engagement_upserts_me_profile() {
     };
     let provider = Arc::new(MockProvider::new(vec![]).with_me(me.clone()));
     let store = MockStore::new();
-    store.upsert_posts(std::slice::from_ref(&my_post), None).unwrap();
+    store
+        .upsert_posts(std::slice::from_ref(&my_post), None)
+        .unwrap();
 
     let ingestor = Ingestor::new(provider, Box::new(NoopNormalizer), Arc::clone(&store));
-    ingestor.ingest_engagement(1).await.expect("ingest_engagement failed");
+    ingestor
+        .ingest_engagement(1)
+        .await
+        .expect("ingest_engagement failed");
 
     let state = store.state.lock().unwrap();
-    assert!(state.upserted_users.iter().any(|u| u.id == UserId::new("real_id_42")),
-        "me profile must be upserted during ingest_engagement");
+    assert!(
+        state
+            .upserted_users
+            .iter()
+            .any(|u| u.id == UserId::new("real_id_42")),
+        "me profile must be upserted during ingest_engagement"
+    );
 }
 
 #[tokio::test]
@@ -753,8 +904,13 @@ async fn ingest_me_upserts_me_profile() {
     ingestor.ingest_me().await.expect("ingest_me failed");
 
     let state = store.state.lock().unwrap();
-    assert!(state.upserted_users.iter().any(|u| u.id == UserId::new("real_id_99")),
-        "me profile must be upserted during ingest_me");
+    assert!(
+        state
+            .upserted_users
+            .iter()
+            .any(|u| u.id == UserId::new("real_id_99")),
+        "me profile must be upserted during ingest_me"
+    );
 }
 
 #[tokio::test]
@@ -762,7 +918,9 @@ async fn resolve_author_called_with_correct_args() {
     let me = User {
         id: UserId::new("real_77"),
         username: Some("carol".into()),
-        name: None, biography: None, profile_picture_url: None,
+        name: None,
+        biography: None,
+        profile_picture_url: None,
     };
     let provider = Arc::new(MockProvider::new(vec![vec![]]).with_me(me.clone()));
     let store = MockStore::new();
@@ -770,7 +928,196 @@ async fn resolve_author_called_with_correct_args() {
     ingestor.ingest_me().await.expect("ingest_me failed");
     let state = store.state.lock().unwrap();
     assert!(
-        state.resolve_author_calls.iter().any(|(u, id)| u == "carol" && *id == UserId::new("real_77")),
+        state
+            .resolve_author_calls
+            .iter()
+            .any(|(u, id)| u == "carol" && *id == UserId::new("real_77")),
         "resolve_author must be called with (\"carol\", UserId(\"real_77\"))"
     );
+}
+
+fn audience_with_all_breakdowns(followers_count: u64) -> MockAudience {
+    MockAudience {
+        followers_count,
+        demographics: vec![
+            DemographicBucket {
+                dimension: DemographicDimension::Country,
+                bucket: "US".into(),
+                value: 80,
+            },
+            DemographicBucket {
+                dimension: DemographicDimension::City,
+                bucket: "New York".into(),
+                value: 30,
+            },
+            DemographicBucket {
+                dimension: DemographicDimension::Age,
+                bucket: "25-34".into(),
+                value: 45,
+            },
+            DemographicBucket {
+                dimension: DemographicDimension::Gender,
+                bucket: "female".into(),
+                value: 52,
+            },
+        ],
+        fail_dimension: None,
+    }
+}
+
+fn audience_account() -> User {
+    User {
+        id: UserId::new("audience-account"),
+        username: Some("audience_owner".into()),
+        name: None,
+        biography: None,
+        profile_picture_url: None,
+    }
+}
+
+#[tokio::test]
+async fn refresh_audience_writes_count_only_below_demographic_threshold() {
+    // Given: an account below the official demographic threshold.
+    let provider = Arc::new(
+        MockProvider::new(vec![])
+            .with_me(audience_account())
+            .with_audience(audience_with_all_breakdowns(99)),
+    );
+    let store = MockStore::new();
+    let ingestor = Ingestor::new(
+        Arc::clone(&provider),
+        Box::new(NoopNormalizer),
+        Arc::clone(&store),
+    );
+
+    // When: the audience is refreshed.
+    let summary = ingestor
+        .refresh_audience()
+        .await
+        .expect("count-only audience refresh should succeed");
+
+    // Then: only the count is persisted and no demographic call is issued.
+    assert_eq!(summary.account_id, UserId::new("audience-account"));
+    assert_eq!(summary.followers_count, 99);
+    assert_eq!(summary.demographics_count, 0);
+    assert_eq!(
+        *provider.audience_queries.lock().unwrap(),
+        vec![AudienceInsightQuery::FollowersCount]
+    );
+    let state = store.state.lock().unwrap();
+    assert_eq!(state.audience_snapshots.len(), 1);
+    assert!(state.audience_snapshots[0].demographics.is_empty());
+}
+
+#[tokio::test]
+async fn refresh_audience_persists_all_breakdowns_in_one_snapshot() {
+    // Given: an eligible account and one bucket for every required breakdown.
+    let provider = Arc::new(
+        MockProvider::new(vec![])
+            .with_me(audience_account())
+            .with_audience(audience_with_all_breakdowns(100)),
+    );
+    let store = MockStore::new();
+    let ingestor = Ingestor::new(provider, Box::new(NoopNormalizer), Arc::clone(&store));
+
+    // When: the audience is refreshed.
+    let summary = ingestor
+        .refresh_audience()
+        .await
+        .expect("eligible audience refresh should succeed");
+
+    // Then: the summary and atomic snapshot contain every breakdown.
+    assert_eq!(summary.followers_count, 100);
+    assert_eq!(summary.demographics_count, 4);
+    let state = store.state.lock().unwrap();
+    assert_eq!(state.audience_snapshots.len(), 1);
+    let snapshot = &state.audience_snapshots[0];
+    assert_eq!(snapshot.account_id, UserId::new("audience-account"));
+    assert_eq!(snapshot.followers_count, 100);
+    assert_eq!(snapshot.demographics.len(), 4);
+    assert!(snapshot.observed_at <= Utc::now());
+}
+
+#[tokio::test]
+async fn refresh_audience_leaves_no_snapshot_when_a_breakdown_fails() {
+    // Given: the third required breakdown fails before snapshot persistence.
+    let mut audience = audience_with_all_breakdowns(100);
+    audience.fail_dimension = Some(DemographicDimension::Age);
+    let provider = Arc::new(
+        MockProvider::new(vec![])
+            .with_me(audience_account())
+            .with_audience(audience),
+    );
+    let store = MockStore::new();
+    let ingestor = Ingestor::new(provider, Box::new(NoopNormalizer), Arc::clone(&store));
+
+    // When: the audience refresh reaches the failing breakdown.
+    let result = ingestor.refresh_audience().await;
+
+    // Then: no partial snapshot is written.
+    assert!(matches!(result, Err(Error::Parse(_))));
+    assert!(store.state.lock().unwrap().audience_snapshots.is_empty());
+}
+
+#[tokio::test]
+async fn refresh_audience_deduplicates_mentions_and_stops_on_repeated_cursor() {
+    // Given: a mention page whose next cursor repeats and contains a duplicate post.
+    let mut mention = MockProvider::make_post("mentioned-post", "another-user");
+    mention.mentions.push(Mention {
+        username: "audience_owner".into(),
+        user_id: Some(UserId::new("audience-account")),
+    });
+    let provider = Arc::new(
+        MockProvider::new(vec![])
+            .with_me(audience_account())
+            .with_audience(audience_with_all_breakdowns(99))
+            .with_mentions(Page::new(vec![mention], Some(Cursor("repeat".into())))),
+    );
+    let store = MockStore::new();
+    let ingestor = Ingestor::new(
+        Arc::clone(&provider),
+        Box::new(NoopNormalizer),
+        Arc::clone(&store),
+    );
+
+    // When: mention ingestion encounters the repeated cursor.
+    let summary = ingestor
+        .refresh_audience()
+        .await
+        .expect("repeated mention cursor must not fail the refresh");
+
+    // Then: the post is persisted once with the authenticated mention target.
+    assert_eq!(summary.mentions_ingested, 1);
+    assert_eq!(provider.mention_requests.lock().unwrap().len(), 2);
+    let state = store.state.lock().unwrap();
+    assert_eq!(state.upserted.len(), 1);
+    assert_eq!(state.upserted[0].mentions.len(), 1);
+    assert_eq!(state.upserted[0].mentions[0].username, "audience_owner");
+    assert_eq!(
+        state.upserted[0].mentions[0].user_id,
+        Some(UserId::new("audience-account"))
+    );
+}
+
+#[tokio::test]
+async fn refresh_audience_retains_snapshot_when_mentions_are_permission_denied() {
+    // Given: successful insights and a documented-scope failure for mentions.
+    let provider = Arc::new(
+        MockProvider::new(vec![])
+            .with_me(audience_account())
+            .with_audience(audience_with_all_breakdowns(99))
+            .with_mention_error(MockProviderError::PermissionDenied),
+    );
+    let store = MockStore::new();
+    let ingestor = Ingestor::new(provider, Box::new(NoopNormalizer), Arc::clone(&store));
+
+    // When: the mentions phase fails after the snapshot phase succeeds.
+    let summary = ingestor
+        .refresh_audience()
+        .await
+        .expect("mention permission denial must become a warning");
+
+    // Then: the snapshot remains durable and the warning is typed in the summary.
+    assert!(summary.mention_warning.is_some());
+    assert_eq!(store.state.lock().unwrap().audience_snapshots.len(), 1);
 }

@@ -13,5 +13,5 @@ pub mod store_shim;
 
 // Convenience re-exports for downstream crates.
 pub use normalizer::{NormalizeError, Normalizer, OfficialNormalizer};
-pub use orchestrator::Ingestor;
+pub use orchestrator::{AudienceRefreshSummary, Ingestor, MentionIngestWarning};
 pub use store_shim::StoreWrite;
