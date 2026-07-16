@@ -1,6 +1,9 @@
 use async_trait::async_trait;
 
-use crate::{Cursor, Error, Page, Post, PostId, Result, User};
+use crate::{
+    AudienceInsightQuery, AudienceInsightResult, Cursor, Error, Page, Post, PostId, Result, User,
+    UserId,
+};
 
 /// The central abstraction for any Threads data source.
 ///
@@ -61,10 +64,7 @@ pub trait Provider: Send + Sync {
 
     /// Publish a previously created container, returning the new post id.
     /// Default impl returns `Error::NotSupported`.
-    async fn publish_container(
-        &self,
-        _id: &crate::publish::ContainerId,
-    ) -> Result<PostId> {
+    async fn publish_container(&self, _id: &crate::publish::ContainerId) -> Result<PostId> {
         Err(Error::NotSupported("publish_container".into()))
     }
 
@@ -87,6 +87,27 @@ pub trait Provider: Send + Sync {
     /// Default impl returns `Error::NotSupported`.
     async fn fetch_post(&self, _id: &PostId) -> Result<Post> {
         Err(Error::NotSupported("fetch_post".into()))
+    }
+
+    /// Fetch one audience insight for a user.
+    /// Default impl returns `Error::NotSupported`.
+    async fn fetch_audience_insight(
+        &self,
+        _user_id: &UserId,
+        _query: AudienceInsightQuery,
+    ) -> Result<AudienceInsightResult> {
+        Err(Error::NotSupported("fetch_audience_insight".into()))
+    }
+
+    /// Fetch one page of posts that mention a user.
+    /// Default impl returns `Error::NotSupported`.
+    async fn fetch_mentions(
+        &self,
+        _user_id: &UserId,
+        _cursor: Option<Cursor>,
+        _limit: usize,
+    ) -> Result<Page<Post>> {
+        Err(Error::NotSupported("fetch_mentions".into()))
     }
 
     /// Create a single carousel child container for one media item
@@ -113,17 +134,36 @@ pub trait Provider: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::publish::{ContainerId, MediaInput, MediaInputKind, PublishRequest, PublishMediaType};
+    use crate::publish::{
+        ContainerId, MediaInput, MediaInputKind, PublishMediaType, PublishRequest,
+    };
 
     struct StubProvider;
 
     #[async_trait::async_trait]
     impl Provider for StubProvider {
-        fn name(&self) -> &'static str { "stub" }
-        async fn fetch_me(&self) -> crate::Result<crate::User> { unimplemented!() }
-        async fn fetch_my_threads(&self, _: Option<crate::Cursor>) -> crate::Result<crate::Page<crate::Post>> { unimplemented!() }
-        async fn fetch_replies(&self, _: &crate::PostId, _: Option<crate::Cursor>) -> crate::Result<crate::Page<crate::Post>> { unimplemented!() }
-        async fn fetch_thread(&self, _: &crate::PostId) -> crate::Result<Vec<crate::Post>> { unimplemented!() }
+        fn name(&self) -> &'static str {
+            "stub"
+        }
+        async fn fetch_me(&self) -> crate::Result<crate::User> {
+            unimplemented!()
+        }
+        async fn fetch_my_threads(
+            &self,
+            _: Option<crate::Cursor>,
+        ) -> crate::Result<crate::Page<crate::Post>> {
+            unimplemented!()
+        }
+        async fn fetch_replies(
+            &self,
+            _: &crate::PostId,
+            _: Option<crate::Cursor>,
+        ) -> crate::Result<crate::Page<crate::Post>> {
+            unimplemented!()
+        }
+        async fn fetch_thread(&self, _: &crate::PostId) -> crate::Result<Vec<crate::Post>> {
+            unimplemented!()
+        }
     }
 
     #[tokio::test]
@@ -145,12 +185,67 @@ mod tests {
             url: "https://example.com/a.jpg".into(),
         };
 
-        assert!(matches!(p.create_container(&req).await, Err(crate::Error::NotSupported(_))));
-        assert!(matches!(p.publish_container(&cid).await, Err(crate::Error::NotSupported(_))));
-        assert!(matches!(p.container_status(&cid).await, Err(crate::Error::NotSupported(_))));
-        assert!(matches!(p.publishing_limits().await, Err(crate::Error::NotSupported(_))));
-        assert!(matches!(p.fetch_post(&pid).await, Err(crate::Error::NotSupported(_))));
-        assert!(matches!(p.create_carousel_item(&item).await, Err(crate::Error::NotSupported(_))));
-        assert!(matches!(p.create_carousel_container(&req, std::slice::from_ref(&cid)).await, Err(crate::Error::NotSupported(_))));
+        assert!(matches!(
+            p.create_container(&req).await,
+            Err(crate::Error::NotSupported(_))
+        ));
+        assert!(matches!(
+            p.publish_container(&cid).await,
+            Err(crate::Error::NotSupported(_))
+        ));
+        assert!(matches!(
+            p.container_status(&cid).await,
+            Err(crate::Error::NotSupported(_))
+        ));
+        assert!(matches!(
+            p.publishing_limits().await,
+            Err(crate::Error::NotSupported(_))
+        ));
+        assert!(matches!(
+            p.fetch_post(&pid).await,
+            Err(crate::Error::NotSupported(_))
+        ));
+        assert!(matches!(
+            p.create_carousel_item(&item).await,
+            Err(crate::Error::NotSupported(_))
+        ));
+        assert!(matches!(
+            p.create_carousel_container(&req, std::slice::from_ref(&cid))
+                .await,
+            Err(crate::Error::NotSupported(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn baseline_fetch_post_default_is_not_supported() {
+        let provider = StubProvider;
+        let post_id = crate::PostId::new("p1");
+
+        assert!(matches!(
+            provider.fetch_post(&post_id).await,
+            Err(crate::Error::NotSupported(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn audience_and_mentions_defaults_are_not_supported() {
+        let provider = StubProvider;
+        let user_id = crate::UserId::new("account-1");
+
+        assert!(matches!(
+            provider
+                .fetch_audience_insight(
+                    &user_id,
+                    crate::AudienceInsightQuery::FollowerDemographics(
+                        crate::DemographicDimension::Country
+                    )
+                )
+                .await,
+            Err(crate::Error::NotSupported(_))
+        ));
+        assert!(matches!(
+            provider.fetch_mentions(&user_id, None, 100).await,
+            Err(crate::Error::NotSupported(_))
+        ));
     }
 }

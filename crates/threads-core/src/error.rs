@@ -9,6 +9,9 @@ pub enum Error {
     #[error("authentication error: {0}")]
     Auth(String),
 
+    #[error("permission denied: {0}")]
+    PermissionDenied(String),
+
     #[error("network error: {0}")]
     Network(String),
 
@@ -67,6 +70,10 @@ mod tests {
         assert_eq!(
             Error::Auth("bad token".into()).to_string(),
             "authentication error: bad token"
+        );
+        assert_eq!(
+            Error::PermissionDenied("missing scope".into()).to_string(),
+            "permission denied: missing scope"
         );
         assert_eq!(
             Error::RateLimit {
