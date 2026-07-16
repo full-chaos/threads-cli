@@ -1,9 +1,11 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OpenFlags};
-use threads_core::model::{FetchRun, Post, PostId, User, UserId};
+use threads_core::model::{AudienceSnapshot, FetchRun, Post, PostId, User, UserId};
+#[cfg(unix)]
+use tracing::warn;
 
 use crate::error::{Result, StoreError};
 use crate::migrations::run_migrations;
@@ -13,6 +15,7 @@ use crate::query;
 /// `Store` can be `Send + Sync` while rusqlite's `Connection` is `!Send`.
 pub struct Store {
     conn: Mutex<Connection>,
+    database_path: Option<PathBuf>,
 }
 
 // Safety: `Mutex<Connection>` provides the needed mutual exclusion; we never
@@ -21,6 +24,48 @@ unsafe impl Send for Store {}
 unsafe impl Sync for Store {}
 
 impl Store {
+    fn prepare_parent(path: &Path) -> Result<()> {
+        let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        else {
+            return Ok(());
+        };
+        std::fs::create_dir_all(parent)?;
+        #[cfg(unix)]
+        Self::set_private_mode(parent);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn set_private_mode(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+
+        if let Err(error) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)) {
+            warn!(path = %path.display(), %error, "could not secure store directory");
+        }
+    }
+
+    #[cfg(unix)]
+    fn secure_database_files(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut wal = path.as_os_str().to_os_string();
+        wal.push("-wal");
+        let mut shm = path.as_os_str().to_os_string();
+        shm.push("-shm");
+        let paths = [path.to_path_buf(), wal.into(), shm.into()];
+        for file in paths {
+            if !file.exists() {
+                continue;
+            }
+            if let Err(error) =
+                std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600))
+            {
+                warn!(path = %file.display(), %error, "could not secure store database file");
+            }
+        }
+    }
     fn configure(conn: &Connection) -> Result<()> {
         conn.execute_batch(
             "PRAGMA foreign_keys = ON;
@@ -34,14 +79,19 @@ impl Store {
 
     /// Open (or create) a store at `path`.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let path = path.as_ref();
+        Self::prepare_parent(path)?;
         let conn = Connection::open_with_flags(
             path,
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
         )
         .map_err(StoreError::Sqlite)?;
         Self::configure(&conn)?;
+        #[cfg(unix)]
+        Self::secure_database_files(path);
         Ok(Self {
             conn: Mutex::new(conn),
+            database_path: Some(path.to_path_buf()),
         })
     }
 
@@ -51,6 +101,7 @@ impl Store {
         Self::configure(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
+            database_path: None,
         })
     }
 
@@ -79,6 +130,47 @@ impl Store {
     pub fn upsert_posts(&self, posts: &[Post], fetch_run_id: Option<&str>) -> Result<usize> {
         let mut conn = self.conn.lock().unwrap();
         query::upsert_posts(&mut conn, posts, fetch_run_id)
+    }
+
+    pub fn upsert_audience_snapshot(
+        &self,
+        snapshot: &AudienceSnapshot,
+        fetch_run_id: Option<&str>,
+    ) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        query::upsert_audience_snapshot(&mut conn, snapshot, fetch_run_id)?;
+        #[cfg(unix)]
+        if let Some(path) = &self.database_path {
+            Self::secure_database_files(path);
+        }
+        Ok(())
+    }
+
+    pub fn audience_history(
+        &self,
+        account_id: &UserId,
+        limit: usize,
+    ) -> Result<Vec<AudienceSnapshot>> {
+        let conn = self.conn.lock().unwrap();
+        query::audience_history(&conn, account_id, limit)
+    }
+
+    pub fn count_audience_snapshots_before(
+        &self,
+        account_id: &UserId,
+        cutoff: DateTime<Utc>,
+    ) -> Result<u64> {
+        let conn = self.conn.lock().unwrap();
+        query::count_audience_snapshots_before(&conn, account_id, cutoff)
+    }
+
+    pub fn delete_audience_snapshots_before(
+        &self,
+        account_id: &UserId,
+        cutoff: DateTime<Utc>,
+    ) -> Result<u64> {
+        let mut conn = self.conn.lock().unwrap();
+        query::delete_audience_snapshots_before(&mut conn, account_id, cutoff)
     }
 
     pub fn get_post(&self, id: &PostId) -> Result<Option<Post>> {

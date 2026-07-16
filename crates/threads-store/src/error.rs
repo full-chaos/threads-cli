@@ -14,6 +14,12 @@ pub enum StoreError {
 
     #[error("serde: {0}")]
     Serde(#[from] serde_json::Error),
+
+    #[error("filesystem: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("invalid stored data: {0}")]
+    InvalidData(String),
 }
 
 impl From<StoreError> for threads_core::Error {
