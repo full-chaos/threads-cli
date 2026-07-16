@@ -64,6 +64,44 @@ pub struct ChildrenDto {
     pub data: Vec<PostDto>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct InsightsEnvelope {
+    pub data: Vec<InsightDto>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct InsightDto {
+    pub name: String,
+    #[serde(default)]
+    pub values: Vec<InsightValueDto>,
+    #[serde(default)]
+    pub total_value: Option<u64>,
+    #[serde(default)]
+    pub breakdowns: Vec<InsightBreakdownDto>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct InsightValueDto {
+    pub value: u64,
+    #[serde(default)]
+    pub end_time: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct InsightBreakdownDto {
+    #[serde(default)]
+    pub dimension_keys: Vec<String>,
+    #[serde(default)]
+    pub results: Vec<InsightBreakdownResultDto>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct InsightBreakdownResultDto {
+    #[serde(default)]
+    pub dimension_values: Vec<String>,
+    pub value: u64,
+}
+
 /// Pagination envelope: `{ data: [...], paging: { cursors: { before, after } } }`.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Envelope<T> {
@@ -216,5 +254,66 @@ mod tests {
         let r: PublishingLimitResp = serde_json::from_str(inner).unwrap();
         assert_eq!(r.quota_usage, 0);
         assert_eq!(r.config.quota_total, 250);
+    }
+
+    #[test]
+    fn parses_followers_count_fixture() {
+        // Given: the official followers-count response fixture.
+        let fixture = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../threads-ingest/tests/fixtures/audience_followers_count.json"
+        ));
+
+        // When: the response crosses the Insights DTO boundary.
+        let insights: InsightsEnvelope = serde_json::from_str(fixture).unwrap();
+
+        // Then: the typed value remains available without raw JSON traversal.
+        assert_eq!(insights.data[0].name, "followers_count");
+        assert_eq!(insights.data[0].values[0].value, 1234);
+    }
+
+    #[test]
+    fn parses_every_demographic_fixture() {
+        // Given: one official fixture for each supported breakdown dimension.
+        let fixtures = [
+            ("country", "audience_demographics_country.json"),
+            ("city", "audience_demographics_city.json"),
+            ("age", "audience_demographics_age.json"),
+            ("gender", "audience_demographics_gender.json"),
+        ];
+
+        // When: each fixture crosses the Insights DTO boundary.
+        for (dimension, file_name) in fixtures {
+            let fixture_path = format!(
+                "{}/../threads-ingest/tests/fixtures/{file_name}",
+                env!("CARGO_MANIFEST_DIR")
+            );
+            let fixture = std::fs::read_to_string(fixture_path).unwrap();
+            let insights: InsightsEnvelope = serde_json::from_str(&fixture).unwrap();
+
+            // Then: its breakdown is typed with the documented dimension.
+            assert_eq!(
+                insights.data[0].breakdowns[0].dimension_keys,
+                vec![dimension.to_string()]
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_missing_or_noninteger_insight_data() {
+        // Given: malformed and noninteger Insights responses.
+        let malformed = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../threads-ingest/tests/fixtures/audience_malformed.json"
+        ));
+        let noninteger = r#"{"data":[{"name":"followers_count","values":[{"value":"many"}]}]}"#;
+
+        // When: each response crosses the DTO boundary.
+        let missing_data = serde_json::from_str::<InsightsEnvelope>(malformed);
+        let invalid_value = serde_json::from_str::<InsightsEnvelope>(noninteger);
+
+        // Then: both fail at that boundary.
+        assert!(missing_data.is_err());
+        assert!(invalid_value.is_err());
     }
 }

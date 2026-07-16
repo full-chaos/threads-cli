@@ -51,7 +51,7 @@ fields = [
 
 [[objects]]
 name = "user/insights"
-path = "/{threads-user-id}/threads_insights"
+path = "/v1.0/{threads-user-id}/threads_insights"
 method = "GET"
 permission = "threads_manage_insights"
 fields = ["followers_count", "follower_demographics"]
@@ -102,7 +102,7 @@ fields = [
 
 [[edges]]
 name = "user/mentions"
-path = "/{threads-user-id}/mentions"
+path = "/v1.0/{threads-user-id}/mentions"
 method = "GET"
 permission = "threads_manage_mentions"
 paginated = true

@@ -1,16 +1,18 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use threads_core::{
-    Cursor, Error, Media, MediaKind, Page, Post, PostId, Provider, Result, User, UserId,
-};
 use threads_core::publish::{
     ContainerId, ContainerStatus, MediaInput, MediaInputKind, PublishRequest, PublishingLimits,
+};
+use threads_core::{
+    AudienceInsightQuery, AudienceInsightResult, AudienceSnapshot, Cursor, DemographicBucket,
+    DemographicDimension, Error, Media, MediaKind, Page, Post, PostId, Provider, Result, User,
+    UserId,
 };
 use threads_manifest::Manifest;
 
 use crate::{
     client::HttpClient,
-    dto::{Envelope, MeDto, PostDto},
+    dto::{Envelope, InsightDto, InsightsEnvelope, MeDto, PostDto},
 };
 
 pub struct OfficialProvider {
@@ -73,6 +75,10 @@ impl OfficialProvider {
         // media-object id slot, so one helper substitutes both placeholders.
         path.replace("{post-id}", post_id.as_str())
             .replace("{reply-id}", post_id.as_str())
+    }
+
+    fn substitute_user_id(path: &str, user_id: &UserId) -> String {
+        path.replace("{threads-user-id}", user_id.as_str())
     }
 
     pub(crate) fn substitute_container_id(path: &str, id: &ContainerId) -> String {
@@ -212,6 +218,48 @@ impl Provider for OfficialProvider {
         Ok(envelope_to_page(env, None))
     }
 
+    async fn fetch_audience_insight(
+        &self,
+        user_id: &UserId,
+        query: AudienceInsightQuery,
+    ) -> Result<AudienceInsightResult> {
+        let path = self
+            .object_path("user/insights")
+            .ok_or_else(|| Error::Manifest("missing object `user/insights`".into()))?;
+        let path = Self::substitute_user_id(&path, user_id);
+        let owned_params = audience_insight_params(&query);
+        let params: Vec<(&str, &str)> = owned_params
+            .iter()
+            .map(|(key, value)| (*key, value.as_str()))
+            .collect();
+        let insights: InsightsEnvelope = self.http.get_json(&path, &params).await?;
+        insight_to_result(insights, user_id, query)
+    }
+
+    async fn fetch_mentions(
+        &self,
+        user_id: &UserId,
+        cursor: Option<Cursor>,
+        _limit: usize,
+    ) -> Result<Page<Post>> {
+        let path = self
+            .edge_path("user/mentions")
+            .ok_or_else(|| Error::Manifest("missing edge `user/mentions`".into()))?;
+        let path = Self::substitute_user_id(&path, user_id);
+        let fields = self.endpoint_fields("user/mentions");
+        let mut params: Vec<(&str, &str)> = vec![("limit", "100")];
+        if let Some(ref fields) = fields {
+            params.push(("fields", fields));
+        }
+        let after;
+        if let Some(cursor) = cursor {
+            after = cursor.0;
+            params.push(("after", &after));
+        }
+        let mentions: Envelope<PostDto> = self.http.get_json(&path, &params).await?;
+        Ok(envelope_to_page(mentions, None))
+    }
+
     async fn fetch_replies(&self, post_id: &PostId, cursor: Option<Cursor>) -> Result<Page<Post>> {
         let path = self
             .edge_path("post/replies")
@@ -278,18 +326,13 @@ impl Provider for OfficialProvider {
         Ok(())
     }
 
-    async fn create_container(
-        &self,
-        req: &PublishRequest,
-    ) -> threads_core::Result<ContainerId> {
+    async fn create_container(&self, req: &PublishRequest) -> threads_core::Result<ContainerId> {
         let path = self
             .action_path("post/create")
             .ok_or_else(|| Error::Manifest("missing action `post/create`".into()))?;
         let owned_params = build_create_params(req);
-        let borrowed: Vec<(&str, &str)> = owned_params
-            .iter()
-            .map(|(k, v)| (*k, v.as_str()))
-            .collect();
+        let borrowed: Vec<(&str, &str)> =
+            owned_params.iter().map(|(k, v)| (*k, v.as_str())).collect();
         let val = self.http.post_json(&path, &borrowed).await?;
         let resp: crate::dto::CreateContainerResp =
             serde_json::from_value(val).map_err(threads_core::Error::from)?;
@@ -311,15 +354,14 @@ impl Provider for OfficialProvider {
         Ok(threads_core::PostId::new(resp.id))
     }
 
-    async fn container_status(
-        &self,
-        id: &ContainerId,
-    ) -> threads_core::Result<ContainerStatus> {
+    async fn container_status(&self, id: &ContainerId) -> threads_core::Result<ContainerStatus> {
         let path = self
             .object_path("container")
             .ok_or_else(|| Error::Manifest("missing object `container`".into()))?;
         let path = Self::substitute_container_id(&path, id);
-        let fields = self.endpoint_fields("container").unwrap_or_else(|| "status".into());
+        let fields = self
+            .endpoint_fields("container")
+            .unwrap_or_else(|| "status".into());
         let val: serde_json::Value = self
             .http
             .get_json(&path, &[("fields", fields.as_str())])
@@ -344,9 +386,9 @@ impl Provider for OfficialProvider {
             .get_json(&path, &[("fields", fields.as_str())])
             .await?;
         let item = if let Some(arr) = raw.get("data").and_then(|d| d.as_array()) {
-            arr.first()
-                .cloned()
-                .ok_or_else(|| threads_core::Error::Parse("publishing_limit data array is empty".into()))?
+            arr.first().cloned().ok_or_else(|| {
+                threads_core::Error::Parse("publishing_limit data array is empty".into())
+            })?
         } else {
             raw
         };
@@ -360,7 +402,10 @@ impl Provider for OfficialProvider {
         })
     }
 
-    async fn fetch_post(&self, id: &threads_core::PostId) -> threads_core::Result<threads_core::Post> {
+    async fn fetch_post(
+        &self,
+        id: &threads_core::PostId,
+    ) -> threads_core::Result<threads_core::Post> {
         let path = self
             .object_path("post")
             .ok_or_else(|| Error::Manifest("missing object `post`".into()))?;
@@ -374,18 +419,13 @@ impl Provider for OfficialProvider {
         Ok(dto_to_post(dto, None))
     }
 
-    async fn create_carousel_item(
-        &self,
-        item: &MediaInput,
-    ) -> threads_core::Result<ContainerId> {
+    async fn create_carousel_item(&self, item: &MediaInput) -> threads_core::Result<ContainerId> {
         let path = self
             .action_path("post/create")
             .ok_or_else(|| threads_core::Error::Manifest("missing action `post/create`".into()))?;
         let owned_params = build_carousel_item_params(item);
-        let borrowed: Vec<(&str, &str)> = owned_params
-            .iter()
-            .map(|(k, v)| (*k, v.as_str()))
-            .collect();
+        let borrowed: Vec<(&str, &str)> =
+            owned_params.iter().map(|(k, v)| (*k, v.as_str())).collect();
         let val = self.http.post_json(&path, &borrowed).await?;
         let resp: crate::dto::CreateContainerResp =
             serde_json::from_value(val).map_err(threads_core::Error::from)?;
@@ -401,15 +441,109 @@ impl Provider for OfficialProvider {
             .action_path("post/create")
             .ok_or_else(|| threads_core::Error::Manifest("missing action `post/create`".into()))?;
         let owned_params = build_carousel_parent_params(req, children);
-        let borrowed: Vec<(&str, &str)> = owned_params
-            .iter()
-            .map(|(k, v)| (*k, v.as_str()))
-            .collect();
+        let borrowed: Vec<(&str, &str)> =
+            owned_params.iter().map(|(k, v)| (*k, v.as_str())).collect();
         let val = self.http.post_json(&path, &borrowed).await?;
         let resp: crate::dto::CreateContainerResp =
             serde_json::from_value(val).map_err(threads_core::Error::from)?;
         Ok(ContainerId::new(resp.id))
     }
+}
+
+fn audience_insight_params(query: &AudienceInsightQuery) -> Vec<(&'static str, String)> {
+    match query {
+        AudienceInsightQuery::FollowersCount => vec![("metric", "followers_count".into())],
+        AudienceInsightQuery::FollowerDemographics(dimension) => vec![
+            ("metric", "follower_demographics".into()),
+            ("breakdown", demographic_dimension_wire(dimension).into()),
+        ],
+    }
+}
+
+fn insight_to_result(
+    insights: InsightsEnvelope,
+    user_id: &UserId,
+    query: AudienceInsightQuery,
+) -> Result<AudienceInsightResult> {
+    let expected_name = audience_query_metric(&query);
+    let insight = insights
+        .data
+        .into_iter()
+        .find(|insight| insight.name == expected_name)
+        .ok_or_else(|| Error::Parse(format!("missing {expected_name} insight data")))?;
+
+    match query {
+        AudienceInsightQuery::FollowersCount => followers_count_result(insight),
+        AudienceInsightQuery::FollowerDemographics(dimension) => {
+            demographics_result(insight, user_id, dimension)
+        }
+    }
+}
+
+const fn audience_query_metric(query: &AudienceInsightQuery) -> &'static str {
+    match query {
+        AudienceInsightQuery::FollowersCount => "followers_count",
+        AudienceInsightQuery::FollowerDemographics(_) => "follower_demographics",
+    }
+}
+
+const fn demographic_dimension_wire(dimension: &DemographicDimension) -> &'static str {
+    match dimension {
+        DemographicDimension::Country => "country",
+        DemographicDimension::City => "city",
+        DemographicDimension::Age => "age",
+        DemographicDimension::Gender => "gender",
+    }
+}
+
+fn followers_count_result(insight: InsightDto) -> Result<AudienceInsightResult> {
+    let value = insight
+        .values
+        .first()
+        .map(|value| value.value)
+        .ok_or_else(|| Error::Parse("followers_count insight is missing a value".into()))?;
+    Ok(AudienceInsightResult::FollowersCount(value))
+}
+
+fn demographics_result(
+    insight: InsightDto,
+    user_id: &UserId,
+    dimension: DemographicDimension,
+) -> Result<AudienceInsightResult> {
+    let expected_dimension = demographic_dimension_wire(&dimension);
+    let [breakdown] = insight.breakdowns.as_slice() else {
+        return Err(Error::Parse(
+            "follower_demographics insight is missing one breakdown".into(),
+        ));
+    };
+    if breakdown.dimension_keys.as_slice() != [expected_dimension] {
+        return Err(Error::Parse(format!(
+            "follower_demographics breakdown does not match {expected_dimension}"
+        )));
+    }
+    let buckets = breakdown
+        .results
+        .iter()
+        .map(|result| {
+            let bucket = result.dimension_values.first().cloned().ok_or_else(|| {
+                Error::Parse("follower_demographics result is missing a dimension value".into())
+            })?;
+            Ok(DemographicBucket {
+                dimension,
+                bucket,
+                value: result.value,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let followers_count = insight.total_value.ok_or_else(|| {
+        Error::Parse("follower_demographics insight is missing total_value".into())
+    })?;
+    Ok(AudienceInsightResult::Demographics(AudienceSnapshot {
+        account_id: user_id.clone(),
+        observed_at: Utc::now(),
+        followers_count,
+        demographics: buckets,
+    }))
 }
 
 pub(crate) fn envelope_to_page(env: Envelope<PostDto>, root_hint: Option<&PostId>) -> Page<Post> {
@@ -435,7 +569,11 @@ pub(crate) fn dto_to_post(dto: PostDto, root_hint: Option<&PostId>) -> Post {
         .owner
         .as_ref()
         .map(|o| UserId::new(&o.id))
-        .or_else(|| dto.username.as_deref().map(|u| UserId::new(format!("@{u}"))))
+        .or_else(|| {
+            dto.username
+                .as_deref()
+                .map(|u| UserId::new(format!("@{u}")))
+        })
         .unwrap_or_else(|| UserId::new(""));
     let parent_id = dto.replied_to.as_ref().map(|r| PostId::new(&r.id));
     let root_id = dto
@@ -447,6 +585,7 @@ pub(crate) fn dto_to_post(dto: PostDto, root_hint: Option<&PostId>) -> Post {
     Post {
         id: PostId::new(dto.id),
         author,
+        author_username: dto.username.clone(),
         text: dto.text,
         created_at,
         parent_id,
@@ -522,6 +661,58 @@ fn parse_timestamp(s: &str) -> Option<DateTime<Utc>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client::HttpClient;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+        time::{Duration, timeout},
+    };
+
+    struct ServerReply {
+        status: &'static str,
+        body: &'static str,
+    }
+
+    async fn one_shot_server(reply: ServerReply) -> (String, tokio::task::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let (mut stream, _) = timeout(Duration::from_secs(2), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            let mut request = vec![0_u8; 8_192];
+            let bytes = timeout(Duration::from_secs(2), stream.read(&mut request))
+                .await
+                .unwrap()
+                .unwrap();
+            let response = format!(
+                "HTTP/1.1 {}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                reply.status,
+                reply.body.len(),
+                reply.body,
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            String::from_utf8(request[..bytes].to_vec()).unwrap()
+        });
+        (format!("http://{address}"), handle)
+    }
+
+    fn audience_provider(base_url: &str) -> OfficialProvider {
+        let manifest_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../manifests/official_v1.toml"
+        );
+        OfficialProvider::new(
+            HttpClient::new(base_url, "test-token").unwrap(),
+            Manifest::from_path(manifest_path).unwrap(),
+        )
+    }
+
+    fn request_url(request: &str) -> url::Url {
+        let target = request.split_whitespace().nth(1).unwrap();
+        url::Url::parse(&format!("http://local{target}")).unwrap()
+    }
 
     // ---- publish param building ----
 
@@ -546,7 +737,10 @@ mod tests {
 
     #[test]
     fn create_container_reply_params_include_reply_to_id() {
-        use threads_core::{PostId, publish::{PublishMediaType, PublishRequest}};
+        use threads_core::{
+            PostId,
+            publish::{PublishMediaType, PublishRequest},
+        };
         let req = PublishRequest {
             media_type: PublishMediaType::Text,
             text: Some("a reply".into()),
@@ -614,7 +808,10 @@ mod tests {
 
     #[test]
     fn carousel_parent_params_set_children_csv() {
-        use threads_core::{PostId, publish::{ContainerId, PublishMediaType, PublishRequest}};
+        use threads_core::{
+            PostId,
+            publish::{ContainerId, PublishMediaType, PublishRequest},
+        };
         let req = PublishRequest {
             media_type: PublishMediaType::Carousel,
             text: Some("carousel caption".into()),
@@ -655,6 +852,7 @@ mod tests {
         let post = dto_to_post(dto, None);
         assert_eq!(post.id, PostId::new("p1"));
         assert_eq!(post.author, UserId::new("@alice"));
+        assert_eq!(post.author_username.as_deref(), Some("alice"));
     }
 
     #[test]
@@ -712,5 +910,202 @@ mod tests {
         let page = envelope_to_page(env, None);
         assert_eq!(page.items.len(), 1);
         assert_eq!(page.next.as_ref().map(|c| c.0.as_str()), Some("NXT"));
+    }
+
+    #[test]
+    fn substitutes_threads_user_id_in_versioned_audience_path() {
+        let user_id = UserId::new("17841400000000000");
+        let path = OfficialProvider::substitute_user_id(
+            "/v1.0/{threads-user-id}/threads_insights",
+            &user_id,
+        );
+        assert_eq!(path, "/v1.0/17841400000000000/threads_insights");
+    }
+
+    #[test]
+    fn builds_only_documented_audience_queries() {
+        let count = audience_insight_params(&AudienceInsightQuery::FollowersCount);
+        assert_eq!(count, [("metric", "followers_count".to_string())]);
+
+        for (dimension, wire) in [
+            (DemographicDimension::Country, "country"),
+            (DemographicDimension::City, "city"),
+            (DemographicDimension::Age, "age"),
+            (DemographicDimension::Gender, "gender"),
+        ] {
+            let demographics =
+                audience_insight_params(&AudienceInsightQuery::FollowerDemographics(dimension));
+            assert_eq!(
+                demographics,
+                [
+                    ("metric", "follower_demographics".to_string()),
+                    ("breakdown", wire.to_string()),
+                ]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn fetches_followers_count_over_the_versioned_insights_path() {
+        let reply = ServerReply {
+            status: "200 OK",
+            body: include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../threads-ingest/tests/fixtures/audience_followers_count.json"
+            )),
+        };
+        let (base_url, server) = one_shot_server(reply).await;
+        let provider = audience_provider(&base_url);
+
+        let result = provider
+            .fetch_audience_insight(
+                &UserId::new("17841400000000000"),
+                AudienceInsightQuery::FollowersCount,
+            )
+            .await
+            .unwrap();
+        let request = server.await.unwrap();
+        let request_url = request_url(&request);
+
+        assert_eq!(result, AudienceInsightResult::FollowersCount(1234));
+        assert_eq!(
+            request_url.path(),
+            "/v1.0/17841400000000000/threads_insights"
+        );
+        assert_eq!(
+            request_url
+                .query_pairs()
+                .collect::<std::collections::HashMap<_, _>>(),
+            std::collections::HashMap::from([
+                ("metric".into(), "followers_count".into()),
+                ("access_token".into(), "test-token".into()),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn fetches_one_demographic_breakdown_without_date_ranges() {
+        let reply = ServerReply {
+            status: "200 OK",
+            body: include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../threads-ingest/tests/fixtures/audience_demographics_country.json"
+            )),
+        };
+        let (base_url, server) = one_shot_server(reply).await;
+        let provider = audience_provider(&base_url);
+
+        let result = provider
+            .fetch_audience_insight(
+                &UserId::new("17841400000000000"),
+                AudienceInsightQuery::FollowerDemographics(DemographicDimension::Country),
+            )
+            .await
+            .unwrap();
+        let request = server.await.unwrap();
+        let request_url = request_url(&request);
+        let query = request_url
+            .query_pairs()
+            .collect::<std::collections::HashMap<_, _>>();
+
+        assert!(
+            matches!(result, AudienceInsightResult::Demographics(snapshot) if snapshot.demographics.len() == 2)
+        );
+        assert_eq!(
+            query.get("metric").map(|value| value.as_ref()),
+            Some("follower_demographics")
+        );
+        assert_eq!(
+            query.get("breakdown").map(|value| value.as_ref()),
+            Some("country")
+        );
+        assert!(!query.contains_key("since"));
+        assert!(!query.contains_key("until"));
+    }
+
+    #[tokio::test]
+    async fn fetches_mentions_with_a_fixed_limit_and_cursor() {
+        let reply = ServerReply {
+            status: "200 OK",
+            body: include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../threads-ingest/tests/fixtures/mentions_page.json"
+            )),
+        };
+        let (base_url, server) = one_shot_server(reply).await;
+        let provider = audience_provider(&base_url);
+
+        let page = provider
+            .fetch_mentions(
+                &UserId::new("17841400000000000"),
+                Some(Cursor("after-cursor".into())),
+                12,
+            )
+            .await
+            .unwrap();
+        let request = server.await.unwrap();
+        let request_url = request_url(&request);
+        let query = request_url
+            .query_pairs()
+            .collect::<std::collections::HashMap<_, _>>();
+
+        assert_eq!(request_url.path(), "/v1.0/17841400000000000/mentions");
+        assert_eq!(query.get("limit").map(|value| value.as_ref()), Some("100"));
+        assert_eq!(
+            query.get("after").map(|value| value.as_ref()),
+            Some("after-cursor")
+        );
+        assert_eq!(page.next, Some(Cursor("QVFIUnhR".into())));
+        assert_eq!(page.items[0].author_username.as_deref(), Some("author"));
+    }
+
+    #[test]
+    fn parses_terminal_mentions_fixture_without_a_cursor() {
+        let fixture = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../threads-ingest/tests/fixtures/mentions_terminal_page.json"
+        ));
+        let mentions: Envelope<PostDto> = serde_json::from_str(fixture).unwrap();
+        let page = envelope_to_page(mentions, None);
+
+        assert!(page.items.is_empty());
+        assert!(page.next.is_none());
+    }
+
+    #[test]
+    fn rejects_empty_insight_data_during_conversion() {
+        let fixture = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../threads-ingest/tests/fixtures/audience_empty_data.json"
+        ));
+        let insights: InsightsEnvelope = serde_json::from_str(fixture).unwrap();
+        let result = insight_to_result(
+            insights,
+            &UserId::new("17841400000000000"),
+            AudienceInsightQuery::FollowersCount,
+        );
+
+        assert!(matches!(result, Err(Error::Parse(_))));
+    }
+
+    #[tokio::test]
+    async fn fetch_mentions_maps_forbidden_responses_to_permission_denied() {
+        let reply = ServerReply {
+            status: "403 Forbidden",
+            body: include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../threads-ingest/tests/fixtures/audience_403.json"
+            )),
+        };
+        let (base_url, server) = one_shot_server(reply).await;
+        let provider = audience_provider(&base_url);
+
+        let result = provider
+            .fetch_mentions(&UserId::new("17841400000000000"), None, 100)
+            .await;
+        let request = server.await.unwrap();
+
+        assert!(request.starts_with("GET /v1.0/17841400000000000/mentions?"));
+        assert!(matches!(result, Err(Error::PermissionDenied(_))));
     }
 }

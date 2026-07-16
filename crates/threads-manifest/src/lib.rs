@@ -240,7 +240,7 @@ version = "v1.0"
             .object("user/insights")
             .expect("user/insights object missing");
         assert_eq!(insights.method, "GET");
-        assert_eq!(insights.path, "/{threads-user-id}/threads_insights");
+        assert_eq!(insights.path, "/v1.0/{threads-user-id}/threads_insights");
         assert_eq!(
             insights.permission.as_deref(),
             Some("threads_manage_insights")
@@ -254,7 +254,7 @@ version = "v1.0"
             .edge("user/mentions")
             .expect("user/mentions edge missing");
         assert_eq!(mentions.method, "GET");
-        assert_eq!(mentions.path, "/{threads-user-id}/mentions");
+        assert_eq!(mentions.path, "/v1.0/{threads-user-id}/mentions");
         assert_eq!(
             mentions.permission.as_deref(),
             Some("threads_manage_mentions")
