@@ -1,13 +1,13 @@
 [workspace]
 resolver = "3"
 members = [
-    "crates/threads-core",
-    "crates/threads-manifest",
-    "crates/threads-provider-official",
-    "crates/threads-provider-web",
-    "crates/threads-store",
-    "crates/threads-ingest",
-    "crates/threads-cli",
+  "crates/threads-core",
+  "crates/threads-manifest",
+  "crates/threads-provider-official",
+  "crates/threads-provider-web",
+  "crates/threads-store",
+  "crates/threads-ingest",
+  "crates/threads-cli",
 ]
 
 [workspace.package]
@@ -16,15 +16,27 @@ edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
 authors = ["threads-cli contributors"]
-repository = "https://github.com/chrisgeorge/threads-cli"
+repository = "https://github.com/chrisgeo/threads-cli"
 
 [workspace.dependencies]
 # async runtime
-tokio = { version = "1.40", features = ["rt-multi-thread", "macros", "net", "io-util", "signal", "time", "fs"] }
+tokio = { version = "1.40", features = [
+  "rt-multi-thread",
+  "macros",
+  "net",
+  "io-util",
+  "signal",
+  "time",
+  "fs",
+] }
 async-trait = "0.1"
 
 # http
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = [
+  "rustls-tls",
+  "json",
+  "stream",
+] }
 url = { version = "2.5", features = ["serde"] }
 
 # serde + formats
@@ -47,7 +59,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 # utilities
 chrono = { version = "0.4", features = ["serde"] }
-keyring = { version = "3", default-features = false, features = ["apple-native", "sync-secret-service"] }
+keyring = { version = "3", default-features = false, features = [
+  "apple-native",
+  "sync-secret-service",
+] }
 dirs = "5"
 
 # test helpers
