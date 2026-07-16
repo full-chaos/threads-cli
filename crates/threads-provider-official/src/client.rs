@@ -101,7 +101,8 @@ impl HttpClient {
 
             let body = redact::redact(&resp.text().await.unwrap_or_default());
             match status.as_u16() {
-                401 | 403 => return Err(Error::Auth(format!("{status}: {body}"))),
+                401 => return Err(Error::Auth(format!("{status}: {body}"))),
+                403 => return Err(Error::PermissionDenied(format!("{status}: {body}"))),
                 404 => return Err(Error::NotFound(body)),
                 429 => {
                     if attempt > 5 {
@@ -190,7 +191,8 @@ impl HttpClient {
 
             let body = redact::redact(&resp.text().await.unwrap_or_default());
             match status.as_u16() {
-                401 | 403 => return Err(Error::Auth(format!("{status}: {body}"))),
+                401 => return Err(Error::Auth(format!("{status}: {body}"))),
+                403 => return Err(Error::PermissionDenied(format!("{status}: {body}"))),
                 404 => return Err(Error::NotFound(body)),
                 429 => {
                     if attempt > 5 {
@@ -225,11 +227,7 @@ impl HttpClient {
     ///
     /// Equivalent curl shape:
     /// `curl -X POST 'https://graph.threads.net/v1.0/me/threads?media_type=TEXT&text=hi&access_token=...'`.
-    pub async fn post_json(
-        &self,
-        path: &str,
-        query: &[(&str, &str)],
-    ) -> Result<serde_json::Value> {
+    pub async fn post_json(&self, path: &str, query: &[(&str, &str)]) -> Result<serde_json::Value> {
         let mut url = if path.starts_with("http://") || path.starts_with("https://") {
             Url::parse(path)?
         } else {
@@ -283,7 +281,8 @@ impl HttpClient {
 
             let body = redact::redact(&resp.text().await.unwrap_or_default());
             match status.as_u16() {
-                401 | 403 => return Err(Error::Auth(format!("{status}: {body}"))),
+                401 => return Err(Error::Auth(format!("{status}: {body}"))),
+                403 => return Err(Error::PermissionDenied(format!("{status}: {body}"))),
                 404 => return Err(Error::NotFound(body)),
                 429 => {
                     if attempt > 5 {
@@ -387,5 +386,46 @@ mod tests {
         let d = backoff(250);
         assert!(d >= Duration::from_millis(250));
         assert!(d < Duration::from_millis(500));
+    }
+
+    async fn error_response_server(status: u16) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::{io::AsyncWriteExt as _, net::TcpListener};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 {status} Error\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+        (format!("http://{address}"), server)
+    }
+
+    #[tokio::test]
+    async fn get_maps_401_to_auth_and_403_to_permission_denied() {
+        let (unauthorized_base, unauthorized_server) = error_response_server(401).await;
+        let unauthorized = HttpClient::new(&unauthorized_base, "token")
+            .unwrap()
+            .get_json_value("/", &[])
+            .await
+            .unwrap_err();
+        unauthorized_server.await.unwrap();
+        assert!(matches!(unauthorized, Error::Auth(_)));
+
+        let (forbidden_base, forbidden_server) = error_response_server(403).await;
+        let forbidden = HttpClient::new(&forbidden_base, "token")
+            .unwrap()
+            .get_json_value("/", &[])
+            .await
+            .unwrap_err();
+        forbidden_server.await.unwrap();
+        assert!(matches!(forbidden, Error::PermissionDenied(_)));
     }
 }

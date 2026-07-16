@@ -6,9 +6,12 @@ use std::{
 use anyhow::{Result, anyhow, bail};
 use threads_core::{
     Post, Provider,
-    publish::{ContainerId, ContainerStatus, MediaInput, MediaInputKind, PublishMediaType, PublishRequest, PublishingLimits, ReplyControl, validate_text},
+    publish::{
+        ContainerId, ContainerStatus, MediaInput, MediaInputKind, PublishMediaType, PublishRequest,
+        PublishingLimits, ReplyControl, validate_text,
+    },
 };
-use threads_provider_official::{TokenStore, token_store::token_has_scope};
+use threads_provider_official::TokenStore;
 
 use crate::cli::{PostCreateArgs, ReplyControlArg};
 
@@ -21,14 +24,8 @@ pub async fn run(
     let token = TokenStore::new()
         .load()
         .map_err(|e| anyhow!("read token: {e}"))?;
-    let token = match token {
-        Some(t) if token_has_scope(&t, "threads_content_publish") => t,
-        Some(_) => bail!(
-            "stored token lacks `threads_content_publish` scope; run `threads-cli auth login`"
-        ),
-        None => bail!("no stored token; run `threads-cli auth login`"),
-    };
-    let _ = token; // token's access_token is consumed by open_provider
+    let token = token.ok_or_else(|| anyhow!("no stored token; run `threads-cli auth login`"))?;
+    crate::commands::require_recorded_scopes(&token, &["threads_content_publish"])?;
 
     // 2. Build PublishRequest
     let text = resolve_text(args.text.as_deref())?;
@@ -38,10 +35,16 @@ pub async fn run(
 
     let mut media: Vec<MediaInput> = Vec::new();
     for url in &args.image_url {
-        media.push(MediaInput { kind: MediaInputKind::Image, url: url.clone() });
+        media.push(MediaInput {
+            kind: MediaInputKind::Image,
+            url: url.clone(),
+        });
     }
     for url in &args.video_url {
-        media.push(MediaInput { kind: MediaInputKind::Video, url: url.clone() });
+        media.push(MediaInput {
+            kind: MediaInputKind::Video,
+            url: url.clone(),
+        });
     }
 
     let media_type = PublishMediaType::infer(&media);
@@ -186,7 +189,9 @@ fn confirm(yes: bool) -> Result<()> {
         return Ok(());
     }
     if !io::stdin().is_terminal() {
-        bail!("not on a TTY and --yes not passed; aborting. Re-run with --yes to publish without confirmation.");
+        bail!(
+            "not on a TTY and --yes not passed; aborting. Re-run with --yes to publish without confirmation."
+        );
     }
     print!("Publish? [y/N] ");
     use std::io::Write as _;
@@ -266,10 +271,7 @@ pub(crate) async fn publish_flow<P: Provider>(
 
 /// Poll container status up to 5 times, waiting 10 seconds between attempts.
 /// Returns `Ok(())` when status is `Finished`; errors on `Expired`/`Error`/5 attempts.
-async fn poll_until_finished<P: Provider>(
-    provider: &P,
-    cid: &ContainerId,
-) -> Result<()> {
+async fn poll_until_finished<P: Provider>(provider: &P, cid: &ContainerId) -> Result<()> {
     for attempt in 1..=5 {
         let status = provider
             .container_status(cid)
@@ -292,13 +294,11 @@ async fn poll_until_finished<P: Provider>(
     )
 }
 
-fn synthesize_post(
-    post_id: &threads_core::PostId,
-    req: &PublishRequest,
-) -> Post {
+fn synthesize_post(post_id: &threads_core::PostId, req: &PublishRequest) -> Post {
     Post {
         id: post_id.clone(),
         author: threads_core::UserId::new(""),
+        author_username: None,
         text: req.text.clone(),
         created_at: Some(chrono::Utc::now()),
         parent_id: req.reply_to_id.clone(),
@@ -331,6 +331,7 @@ pub mod tests {
         Post {
             id: PostId::new(id),
             author: UserId::new("me"),
+            author_username: None,
             text: Some("published".into()),
             created_at: None,
             parent_id: None,
@@ -410,7 +411,9 @@ pub mod tests {
 
     #[async_trait]
     impl threads_core::Provider for FakeProvider {
-        fn name(&self) -> &'static str { "fake" }
+        fn name(&self) -> &'static str {
+            "fake"
+        }
 
         async fn fetch_me(&self) -> CoreResult<User> {
             Ok(User {
@@ -426,11 +429,7 @@ pub mod tests {
             Ok(Page::empty())
         }
 
-        async fn fetch_replies(
-            &self,
-            _: &PostId,
-            _: Option<Cursor>,
-        ) -> CoreResult<Page<Post>> {
+        async fn fetch_replies(&self, _: &PostId, _: Option<Cursor>) -> CoreResult<Page<Post>> {
             Ok(Page::empty())
         }
 
@@ -438,10 +437,7 @@ pub mod tests {
             Ok(vec![])
         }
 
-        async fn create_container(
-            &self,
-            req: &PublishRequest,
-        ) -> CoreResult<ContainerId> {
+        async fn create_container(&self, req: &PublishRequest) -> CoreResult<ContainerId> {
             let mut s = self.state.lock().unwrap();
             s.created.push(req.clone());
             let id = format!("fake_container_{}", s.next_container_id);
@@ -469,17 +465,16 @@ pub mod tests {
 
         async fn publishing_limits(&self) -> CoreResult<PublishingLimits> {
             let s = self.state.lock().unwrap();
-            s.limits.clone().ok_or_else(|| CoreError::Other("no limits set".into()))
+            s.limits
+                .clone()
+                .ok_or_else(|| CoreError::Other("no limits set".into()))
         }
 
         async fn fetch_post(&self, id: &PostId) -> CoreResult<Post> {
             Ok(fake_post(id.as_str()))
         }
 
-        async fn create_carousel_item(
-            &self,
-            _item: &MediaInput,
-        ) -> CoreResult<ContainerId> {
+        async fn create_carousel_item(&self, _item: &MediaInput) -> CoreResult<ContainerId> {
             let mut s = self.state.lock().unwrap();
             let id = format!("fake_child_{}", s.carousel_item_count);
             s.carousel_item_count += 1;

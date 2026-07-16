@@ -21,6 +21,8 @@ pub const DEFAULT_SCOPES: &[&str] = &[
     "threads_read_replies",
     "threads_delete",
     "threads_content_publish",
+    "threads_manage_insights",
+    "threads_manage_mentions",
 ];
 
 /// Build the URL the user must visit to grant authorization.
@@ -355,6 +357,21 @@ mod tests {
         assert!(
             DEFAULT_SCOPES.contains(&"threads_content_publish"),
             "DEFAULT_SCOPES must include threads_content_publish for the post create command; got: {DEFAULT_SCOPES:?}"
+        );
+    }
+
+    #[test]
+    fn default_scopes_match_the_approved_broad_consent() {
+        assert_eq!(
+            DEFAULT_SCOPES,
+            [
+                "threads_basic",
+                "threads_read_replies",
+                "threads_delete",
+                "threads_content_publish",
+                "threads_manage_insights",
+                "threads_manage_mentions",
+            ]
         );
     }
 

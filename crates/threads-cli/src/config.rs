@@ -6,6 +6,8 @@ use std::{
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+mod config_persistence;
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct CliConfig {
     pub app_id: Option<String>,
@@ -98,12 +100,26 @@ impl CliConfig {
     }
 
     pub fn save_to(&self, path: &Path) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
-        }
         let s = toml::to_string_pretty(self)?;
-        fs::write(path, s).with_context(|| format!("writing {}", path.display()))?;
-        Ok(())
+        config_persistence::create_private_dir(
+            path.parent()
+                .ok_or_else(|| anyhow::anyhow!("config path {} has no parent", path.display()))?,
+        )?;
+        config_persistence::atomic_write_private_file(
+            path,
+            s.as_bytes(),
+            |temporary_path, destination_path| fs::rename(temporary_path, destination_path),
+        )
+    }
+
+    #[cfg(test)]
+    fn save_to_with_failure(&self, path: &Path) -> Result<()> {
+        let s = toml::to_string_pretty(self)?;
+        config_persistence::create_private_dir(
+            path.parent()
+                .ok_or_else(|| anyhow::anyhow!("config path {} has no parent", path.display()))?,
+        )?;
+        config_persistence::atomic_write_with_interruption(path, s.as_bytes())
     }
 
     pub fn db_path(&self) -> PathBuf {
@@ -177,5 +193,21 @@ mod tests {
         let cfg = CliConfig::load(Some(&path)).unwrap();
         assert!(cfg.app_id.is_none());
         assert!(!cfg.db_path.is_empty());
+    }
+
+    #[test]
+    fn atomic_save_keeps_previous_config_bytes_when_replacement_is_interrupted() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        fs::write(&path, b"app_id = \"old\"\n").unwrap();
+        let replacement = CliConfig {
+            app_id: Some("new".to_string()),
+            ..CliConfig::default()
+        };
+
+        let result = replacement.save_to_with_failure(&path);
+
+        assert!(result.is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"app_id = \"old\"\n");
     }
 }

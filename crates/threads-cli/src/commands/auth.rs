@@ -5,6 +5,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow};
+use rand::{TryRng, rngs::SysRng};
 use threads_provider_official::{
     auth::{self, CallbackServer, DEFAULT_SCOPES},
     token_store::{Token, TokenStore},
@@ -12,6 +13,21 @@ use threads_provider_official::{
 use tracing::info;
 
 use crate::{cli::AuthCommand, config::CliConfig};
+
+const REQUESTED_SCOPE_PURPOSES: &[(&str, &str)] = &[
+    ("threads_basic", "read your Threads account basics"),
+    ("threads_read_replies", "read replies to your Threads posts"),
+    ("threads_delete", "delete your Threads posts and replies"),
+    ("threads_content_publish", "publish Threads posts"),
+    (
+        "threads_manage_insights",
+        "read aggregate audience insights",
+    ),
+    (
+        "threads_manage_mentions",
+        "read posts that mention your account",
+    ),
+];
 
 pub async fn run(cmd: AuthCommand, config_override: Option<&Path>) -> Result<()> {
     match cmd {
@@ -35,7 +51,7 @@ async fn login(config_override: Option<&Path>) -> Result<()> {
     let is_loopback_http = provider_cfg.redirect_uri.starts_with("http://127.0.0.1")
         || provider_cfg.redirect_uri.starts_with("http://localhost");
 
-    let state = random_state();
+    let state = random_state()?;
 
     if is_loopback_http {
         login_local_listener(&mut provider_cfg, &state).await
@@ -78,6 +94,7 @@ async fn login_local_listener(
     let url = auth::authorize_url(provider_cfg, DEFAULT_SCOPES, state)
         .map_err(|e| anyhow!("build authorize URL: {e}"))?;
 
+    print_requested_scope_consent();
     println!("Opening browser to authorize threads-cli...");
     println!("If it does not open, visit this URL manually:");
     println!("  {url}");
@@ -100,6 +117,7 @@ async fn login_manual_paste(
     let url = auth::authorize_url(provider_cfg, DEFAULT_SCOPES, state)
         .map_err(|e| anyhow!("build authorize URL: {e}"))?;
 
+    print_requested_scope_consent();
     println!("1. Open this URL in your browser and approve the request:");
     println!("   {url}\n");
     println!(
@@ -141,13 +159,19 @@ async fn finish_login(provider_cfg: &threads_provider_official::Config, code: &s
     let token = Token::new(
         long.access_token,
         long.expires_in,
-        Some(DEFAULT_SCOPES.iter().map(|s| s.to_string()).collect()),
-    );
+        Some(
+            DEFAULT_SCOPES
+                .iter()
+                .map(|scope| (*scope).to_string())
+                .collect(),
+        ),
+    )
+    .with_user_id(long.user_id.or(short.user_id));
     TokenStore::new()
         .save(&token)
         .map_err(|e| anyhow!("save token: {e}"))?;
 
-    println!("Authentication complete; token stored.");
+    println!("Authentication complete; token stored with requested scope metadata.");
     Ok(())
 }
 
@@ -185,8 +209,14 @@ fn status() -> Result<()> {
             if let Some(exp) = t.expires_in {
                 println!("expires_in:  {exp}s");
             }
-            if let Some(scopes) = t.granted_scopes.as_ref() {
-                println!("scopes:      {}", scopes.join(","));
+            if let Some(user_id) = t.user_id.as_deref() {
+                println!("user_id:     {user_id}");
+            }
+            if let Some(scopes) = t.requested_scopes.as_ref() {
+                println!(
+                    "requested_scopes (not confirmed by Meta): {}",
+                    scopes.join(",")
+                );
             }
             println!("expired:     {}", t.is_expired());
         }
@@ -208,16 +238,27 @@ fn logout() -> Result<()> {
 }
 
 /// Short random-ish state string for CSRF protection.
-fn random_state() -> String {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(1);
-    let n = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
-    let c = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let mixed = n ^ c.wrapping_mul(0x9E3779B97F4A7C15);
-    format!("{mixed:x}")
+fn random_state() -> Result<String> {
+    let mut bytes = [0_u8; 32];
+    let mut rng = SysRng;
+    rng.try_fill_bytes(&mut bytes)
+        .map_err(|error| anyhow!("read operating-system entropy for OAuth state: {error}"))?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+fn requested_scope_consent_text() -> String {
+    let scopes = REQUESTED_SCOPE_PURPOSES
+        .iter()
+        .map(|(scope, purpose)| format!("  - {scope}: {purpose}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "threads-cli will request these requested scopes (Meta does not return confirmed grants):\n{scopes}"
+    )
+}
+
+fn print_requested_scope_consent() {
+    println!("{}", requested_scope_consent_text());
 }
 
 #[cfg(test)]
@@ -247,5 +288,27 @@ mod tests {
     #[test]
     fn rejects_url_without_code() {
         assert!(parse_code_from_input("https://example.com/cb?foo=bar").is_err());
+    }
+
+    #[test]
+    fn consent_text_names_every_requested_scope_and_audience_purpose() {
+        let consent = requested_scope_consent_text();
+
+        for scope in DEFAULT_SCOPES {
+            assert!(consent.contains(scope), "missing {scope} from consent text");
+        }
+        assert!(consent.contains("audience insights"));
+        assert!(consent.contains("mentions"));
+        assert!(consent.contains("requested scopes"));
+    }
+
+    #[test]
+    fn oauth_state_uses_full_entropy_and_is_not_reused() {
+        let first = random_state().unwrap();
+        let second = random_state().unwrap();
+
+        assert_eq!(first.len(), 64);
+        assert!(first.chars().all(|character| character.is_ascii_hexdigit()));
+        assert_ne!(first, second);
     }
 }

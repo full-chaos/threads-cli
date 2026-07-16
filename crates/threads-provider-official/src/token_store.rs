@@ -1,4 +1,9 @@
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    io::Write as _,
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -16,8 +21,14 @@ pub struct Token {
     /// record what we requested at login time. This is a heuristic, not a
     /// guarantee — if a request fails with 403/insufficient_scope, re-run
     /// `auth login`.
+    #[serde(
+        default,
+        alias = "granted_scopes",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub requested_scopes: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub granted_scopes: Option<Vec<String>>,
+    pub user_id: Option<String>,
     pub issued_at: DateTime<Utc>,
 }
 
@@ -25,14 +36,20 @@ impl Token {
     pub fn new(
         access_token: impl Into<String>,
         expires_in: Option<i64>,
-        granted_scopes: Option<Vec<String>>,
+        requested_scopes: Option<Vec<String>>,
     ) -> Self {
         Self {
             access_token: access_token.into(),
             expires_in,
-            granted_scopes,
+            requested_scopes,
+            user_id: None,
             issued_at: Utc::now(),
         }
+    }
+
+    pub fn with_user_id(mut self, user_id: Option<String>) -> Self {
+        self.user_id = user_id;
+        self
     }
 
     pub fn is_expired(&self) -> bool {
@@ -49,9 +66,9 @@ impl Token {
 }
 
 /// Strict scope check: returns `true` ONLY when the token records a
-/// `granted_scopes` list and that list contains `scope`.
+/// `requested_scopes` list and that list contains `scope`.
 ///
-/// Tokens minted before scope-tracking shipped (`granted_scopes = None`) are
+/// Tokens minted before scope-tracking shipped (`requested_scopes = None`) are
 /// treated as missing the scope. This is intentionally strict for write
 /// operations like `threads_delete` — those scopes were added in the same
 /// release as scope tracking, so a `None` token by definition does not have
@@ -59,15 +76,16 @@ impl Token {
 /// endpoints don't call this helper.
 pub fn token_has_scope(token: &Token, scope: &str) -> bool {
     token
-        .granted_scopes
+        .requested_scopes
         .as_ref()
         .is_some_and(|scopes| scopes.iter().any(|s| s == scope))
 }
 
 /// Persists an access [`Token`] across runs.
 ///
-/// Prefers the OS keyring (`keyring` crate, service = "threads-cli"). When
-/// keyring access fails, falls back to a JSON file at
+/// Persists atomically so stale keyring entries cannot override replacements.
+///
+/// The fallback file is located at
 /// `~/.config/threads-cli/token.json` with strict permissions (0700 on the
 /// parent directory, 0600 on the file itself) on Unix.
 pub struct TokenStore {
@@ -98,32 +116,29 @@ impl TokenStore {
 
     pub fn save(&self, token: &Token) -> Result<()> {
         let json = serde_json::to_string(token)?;
-        if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER) {
-            if entry.set_password(&json).is_ok() {
-                return Ok(());
-            }
-        }
-        // Fallback: file on disk, restricted to the current user.
         if let Some(parent) = self.fallback_path.parent() {
             create_private_dir(parent)?;
         }
         write_private_file(&self.fallback_path, json.as_bytes())?;
+        if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER) {
+            let _ = entry.set_password(&json);
+        }
         Ok(())
     }
 
     pub fn load(&self) -> Result<Option<Token>> {
-        if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER) {
-            if let Ok(s) = entry.get_password() {
-                let t: Token = serde_json::from_str(&s)?;
-                return Ok(Some(t));
-            }
-        }
         if self.fallback_path.exists() {
             warn_if_world_readable(&self.fallback_path);
             let s = fs::read_to_string(&self.fallback_path)
                 .map_err(|e| Error::Config(format!("reading token file: {e}")))?;
             let t: Token = serde_json::from_str(&s)?;
             return Ok(Some(t));
+        }
+        if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER) {
+            if let Ok(s) = entry.get_password() {
+                let t: Token = serde_json::from_str(&s)?;
+                return Ok(Some(t));
+            }
         }
         Ok(None)
     }
@@ -149,7 +164,7 @@ impl Default for TokenStore {
 // --------------- platform-specific private I/O helpers ---------------
 
 #[cfg(unix)]
-fn create_private_dir(path: &std::path::Path) -> Result<()> {
+fn create_private_dir(path: &Path) -> Result<()> {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 
     if path.exists() {
@@ -173,44 +188,110 @@ fn create_private_dir(path: &std::path::Path) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-fn create_private_dir(path: &std::path::Path) -> Result<()> {
+fn create_private_dir(path: &Path) -> Result<()> {
     // On Windows, file permissions rely on the NTFS ACL inherited from the
     // user profile; keyring is the primary store there anyway.
     fs::create_dir_all(path).map_err(|e| Error::Config(format!("creating token dir: {e}")))
 }
 
 #[cfg(unix)]
-fn write_private_file(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
-    use std::io::Write as _;
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-
-    let mut f = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)
-        .map_err(|e| Error::Config(format!("opening token file: {e}")))?;
-    f.write_all(bytes)
-        .map_err(|e| Error::Config(format!("writing token file: {e}")))?;
-    // Re-assert mode in case the file pre-existed with looser perms.
-    let mut perms = f
-        .metadata()
-        .map_err(|e| Error::Config(format!("stat token file: {e}")))?
-        .permissions();
-    perms.set_mode(0o600);
-    fs::set_permissions(path, perms)
-        .map_err(|e| Error::Config(format!("chmod token file: {e}")))?;
-    Ok(())
+fn write_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    atomic_write_private_file(path, bytes, |temporary_path, destination_path| {
+        fs::rename(temporary_path, destination_path)
+    })
 }
 
 #[cfg(not(unix))]
-fn write_private_file(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
-    fs::write(path, bytes).map_err(|e| Error::Config(format!("writing token file: {e}")))
+fn write_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    atomic_write_private_file(path, bytes, |temporary_path, destination_path| {
+        fs::rename(temporary_path, destination_path)
+    })
+}
+
+fn atomic_write_private_file<F>(path: &Path, bytes: &[u8], persist: F) -> Result<()>
+where
+    F: FnOnce(&Path, &Path) -> std::io::Result<()>,
+{
+    let (mut file, temporary_path) = open_private_temporary_file(path)?;
+    let result = (|| {
+        file.write_all(bytes)
+            .map_err(|e| Error::Config(format!("writing temporary token file: {e}")))?;
+        file.sync_all()
+            .map_err(|e| Error::Config(format!("syncing temporary token file: {e}")))?;
+        drop(file);
+        persist(&temporary_path, path)
+            .map_err(|e| Error::Config(format!("replacing token file atomically: {e}")))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary_path);
+    }
+    result
+}
+
+fn open_private_temporary_file(path: &Path) -> Result<(fs::File, PathBuf)> {
+    const MAX_ATTEMPTS: u8 = 16;
+    static TEMPORARY_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| Error::Config(format!("token path {} has no parent", path.display())))?;
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| Error::Config(format!("token path {} has no file name", path.display())))?
+        .to_string_lossy();
+    for _ in 0..MAX_ATTEMPTS {
+        let sequence = TEMPORARY_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let temporary_path = parent.join(format!(
+            ".{file_name}.{}.{}.tmp",
+            std::process::id(),
+            sequence
+        ));
+        match open_private_new_file(&temporary_path) {
+            Ok(file) => return Ok((file, temporary_path)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(Error::Config(format!(
+                    "creating temporary token file {}: {error}",
+                    temporary_path.display()
+                )));
+            }
+        }
+    }
+    Err(Error::Config(format!(
+        "could not allocate a temporary token file beside {}",
+        path.display()
+    )))
 }
 
 #[cfg(unix)]
-fn warn_if_world_readable(path: &std::path::Path) {
+fn open_private_new_file(path: &Path) -> std::io::Result<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn open_private_new_file(path: &Path) -> std::io::Result<fs::File> {
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+}
+
+#[cfg(test)]
+fn write_private_file_with_failure(path: &Path, bytes: &[u8]) -> Result<()> {
+    atomic_write_private_file(path, bytes, |_, _| {
+        Err(std::io::Error::other("simulated replacement interruption"))
+    })
+}
+
+#[cfg(unix)]
+fn warn_if_world_readable(path: &Path) {
     use std::os::unix::fs::PermissionsExt;
     if let Ok(md) = fs::metadata(path) {
         let mode = md.permissions().mode() & 0o777;
@@ -225,7 +306,7 @@ fn warn_if_world_readable(path: &std::path::Path) {
 }
 
 #[cfg(not(unix))]
-fn warn_if_world_readable(_path: &std::path::Path) {}
+fn warn_if_world_readable(_path: &Path) {}
 
 #[cfg(test)]
 mod tests {
@@ -241,7 +322,7 @@ mod tests {
         let loaded = store.load().unwrap().expect("token should load");
         assert_eq!(loaded.access_token, "abcd");
         assert_eq!(
-            loaded.granted_scopes.as_deref(),
+            loaded.requested_scopes.as_deref(),
             Some(&["threads_basic".to_string()][..])
         );
         store.clear().unwrap();
@@ -265,8 +346,31 @@ mod tests {
             serde_json::from_str(r#"{"access_token":"t","issued_at":"2026-01-01T00:00:00Z"}"#)
                 .unwrap();
 
-        assert!(t.granted_scopes.is_none());
+        assert!(t.requested_scopes.is_none());
         assert!(!token_has_scope(&t, "threads_delete"));
+    }
+
+    #[test]
+    fn legacy_token_json_deserializes_without_a_user_or_requested_scopes() {
+        let token: Token =
+            serde_json::from_str(r#"{"access_token":"t","issued_at":"2026-01-01T00:00:00Z"}"#)
+                .unwrap();
+
+        assert!(token.user_id.is_none());
+        assert!(token.requested_scopes.is_none());
+    }
+
+    #[test]
+    fn legacy_granted_scopes_json_deserializes_as_requested_scopes() {
+        let token: Token = serde_json::from_str(
+            r#"{"access_token":"t","granted_scopes":["threads_basic"],"issued_at":"2026-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            token.requested_scopes.as_deref(),
+            Some(&["threads_basic".to_owned()][..])
+        );
     }
 
     #[test]
@@ -357,5 +461,17 @@ mod tests {
             mode, 0o600,
             "loose file should have been tightened to 0600, got {mode:o}"
         );
+    }
+
+    #[test]
+    fn atomic_fallback_save_keeps_previous_bytes_when_rename_fails() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("token.json");
+        fs::write(&path, b"old token bytes").unwrap();
+
+        let result = write_private_file_with_failure(&path, b"new token bytes");
+
+        assert!(result.is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"old token bytes");
     }
 }

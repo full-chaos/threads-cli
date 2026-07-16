@@ -3,7 +3,9 @@ use std::sync::Arc;
 use anyhow::{Context, Result, anyhow};
 use threads_manifest::Manifest;
 use threads_provider_official::{
-    Config as ProviderConfig, OfficialProvider, TokenStore, client::HttpClient,
+    Config as ProviderConfig, OfficialProvider, TokenStore,
+    client::HttpClient,
+    token_store::{Token, token_has_scope},
 };
 use threads_store::Store;
 
@@ -90,6 +92,21 @@ pub async fn open_provider(_cfg: &CliConfig) -> Result<OfficialProvider> {
     Ok(OfficialProvider::new(http, manifest))
 }
 
+pub fn require_recorded_scopes(token: &Token, required_scopes: &[&str]) -> Result<()> {
+    let missing_scopes = required_scopes
+        .iter()
+        .copied()
+        .filter(|scope| !token_has_scope(token, scope))
+        .collect::<Vec<_>>();
+    if missing_scopes.is_empty() {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "stored token is missing recorded scope(s): {}; run `threads-cli auth login`",
+        missing_scopes.join(", ")
+    ))
+}
+
 pub fn provider_config(cfg: &CliConfig) -> Result<ProviderConfig> {
     Ok(ProviderConfig {
         app_id: cfg
@@ -128,5 +145,19 @@ mod tests {
         };
 
         assert!(dispatch(cli).await.is_ok());
+    }
+
+    #[test]
+    fn scope_preflight_rejects_a_missing_recorded_scope_before_provider_creation() {
+        let token = threads_provider_official::token_store::Token::new(
+            "access-token",
+            None,
+            Some(vec!["threads_basic".to_string()]),
+        );
+
+        let error = require_recorded_scopes(&token, &["threads_manage_insights"]).unwrap_err();
+
+        assert!(error.to_string().contains("threads_manage_insights"));
+        assert!(error.to_string().contains("threads-cli auth login"));
     }
 }
