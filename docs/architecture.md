@@ -63,8 +63,17 @@ pub trait Provider: Send + Sync {
     async fn fetch_my_threads(&self, cursor: Option<Cursor>) -> Result<Page<Post>>;
     async fn fetch_replies(&self, post_id: &PostId, cursor: Option<Cursor>) -> Result<Page<Post>>;
     async fn fetch_thread(&self, root_id: &PostId) -> Result<Vec<Post>>;
+    async fn fetch_audience_insight(&self, user_id: &UserId, query: AudienceInsightQuery)
+        -> Result<AudienceInsightResult>;
+    async fn fetch_mentions(&self, user_id: &UserId, cursor: Option<Cursor>, limit: u32)
+        -> Result<Page<Post>>;
 }
 ```
+
+The complete trait also contains post retrieval, publishing, deletion, and
+reply methods. There is deliberately no follower-list or follow-mutation
+method. Audience insights are aggregate; Mentions are paginated public-media
+records.
 
 Pagination is cursor-based; providers translate their native paging (Meta's
 `paging.cursors.after`, etc.) into our opaque `Cursor(String)`.
@@ -99,8 +108,11 @@ ingest me → orchestrator {
 
 ## Data flow (delete — destructive remote)
 
-Delete is the only write path in v1. Driven by `threads-cli delete posts` /
-`delete replies`; full design at [`docs/plans/delete.md`](plans/delete.md).
+`delete` is the destructive remote-delete path, and `post` performs supported
+remote publishing. `follow` only opens a user-mediated official intent and
+performs no API write. Audience refresh writes account-scoped local snapshots
+and observed mention/reply records; `show`, `engaged`, and `purge` are local.
+Full delete design: [`docs/plans/delete.md`](plans/delete.md).
 
 ```
 delete posts --before X --after Y [--apply] [--limit N]
@@ -135,6 +147,22 @@ Key invariants:
 - **`archive` is intentionally absent.** Meta exposes no remote archive
   endpoint for root posts; the `ingest` command serves the local-archive
   role.
+
+## Data flow (audience refresh)
+
+```
+audience refresh
+    → OfficialProvider: typed Insights (count + one demographic breakdown/call)
+    → threads-core typed AudienceInsightResult
+    → transactional audience snapshot store
+    → separate paginated official Mentions phase
+    → typed Post + Mention records in the local store
+```
+
+Insights persistence is atomic. A Mentions permission/API failure warns while
+retaining a valid snapshot. The resulting trend is local snapshot history, not
+Meta historical data. The web provider is read-only and is not part of this
+flow. Audience/raw data is account-scoped and excluded from post export.
 
 ## Manifest action types
 

@@ -57,7 +57,8 @@ pub enum Command {
     #[command(subcommand)]
     Auth(AuthCommand),
 
-    /// Open the official Threads follow intent for a username.
+    /// Print and optionally open Meta's official Follow Intent; this does not
+    /// perform or confirm a follow.
     Follow(FollowArgs),
 
     /// Refresh and inspect locally observed audience data.
@@ -96,7 +97,7 @@ pub struct InitArgs {
 
 #[derive(Debug, clap::Args)]
 pub struct FollowArgs {
-    /// Threads username to follow (with or without a leading @).
+    /// Threads username for the official Follow Intent (with or without a leading @).
     pub username: String,
 
     /// Print the follow URL without opening a browser.
@@ -106,7 +107,7 @@ pub struct FollowArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum AudienceCommand {
-    /// Fetch the authenticated account's audience observations from Threads.
+    /// Fetch aggregate audience insights and observed public mentions; no follower identities.
     Refresh,
     /// Show locally stored audience observation history.
     Show(AudienceShowArgs),
@@ -313,10 +314,14 @@ mod tests {
         assert!(Cli::try_parse_from(["threads-cli", "audience", "refresh"]).is_ok());
         assert!(Cli::try_parse_from(["threads-cli", "audience", "show"]).is_ok());
         assert!(Cli::try_parse_from(["threads-cli", "audience", "engaged"]).is_ok());
-        assert!(
-            Cli::try_parse_from(["threads-cli", "audience", "purge", "--before", "2026-01-01"])
-                .is_ok()
-        );
+        assert!(Cli::try_parse_from([
+            "threads-cli",
+            "audience",
+            "purge",
+            "--before",
+            "2026-01-01"
+        ])
+        .is_ok());
     }
 
     #[test]
