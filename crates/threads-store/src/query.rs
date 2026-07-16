@@ -1,8 +1,8 @@
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use threads_core::model::{
-    AudienceSnapshot, DemographicBucket, DemographicDimension, EdgeKind, FetchRun, Media,
-    MediaKind, Mention, Post, PostId, UrlEntity, User, UserId,
+    AudienceSnapshot, DemographicBucket, DemographicDimension, EdgeKind, EngagedAccount,
+    EngagementSort, FetchRun, Media, MediaKind, Mention, Post, PostId, UrlEntity, User, UserId,
 };
 use tracing::warn;
 
@@ -118,6 +118,16 @@ fn upsert_post_tx(tx: &Transaction, post: &Post, fetch_run_id: Option<&str>) -> 
     } else {
         post
     };
+
+    if !post.author.as_str().starts_with('@') {
+        if let Some(username) = post
+            .author_username
+            .as_deref()
+            .filter(|name| !name.is_empty())
+        {
+            reconcile_author_tx(tx, username, &post.author, &now)?;
+        }
+    }
 
     // Ensure the author stub exists so the FK is satisfied.
     tx.execute(
@@ -610,6 +620,84 @@ pub fn posts_by_author(conn: &Connection, author: &UserId) -> Result<Vec<PostId>
     Ok(rows)
 }
 
+/// Rank accounts using directly observed reply and mention relationships.
+pub fn rank_engaged_accounts(
+    conn: &Connection,
+    account_id: &UserId,
+    limit: usize,
+    sort: EngagementSort,
+) -> Result<Vec<EngagedAccount>> {
+    let limit = i64::try_from(limit)
+        .map_err(|_| StoreError::InvalidData("engagement limit exceeds SQLite range".into()))?;
+    let sort = match sort {
+        EngagementSort::Total => "total",
+        EngagementSort::Replies => "replies",
+        EngagementSort::Mentions => "mentions",
+    };
+    let mut statement = conn
+        .prepare(
+            "WITH reply_counts AS (
+                 SELECT reply.author_id, COUNT(DISTINCT reply.id) AS replies
+                 FROM posts AS reply
+                 JOIN posts AS parent ON parent.id = reply.parent_id
+                 WHERE parent.author_id = ?1 AND reply.author_id <> ?1
+                 GROUP BY reply.author_id
+             ), mention_counts AS (
+                 SELECT post.author_id, COUNT(DISTINCT mention.post_id) AS mentions
+                 FROM mentions AS mention
+                 JOIN posts AS post ON post.id = mention.post_id
+                 WHERE mention.user_id = ?1 AND post.author_id <> ?1
+                 GROUP BY post.author_id
+             ), engaged_ids AS (
+                 SELECT author_id FROM reply_counts
+                 UNION
+                 SELECT author_id FROM mention_counts
+             )
+             SELECT engaged_ids.author_id, users.username,
+                    COALESCE(reply_counts.replies, 0),
+                    COALESCE(mention_counts.mentions, 0)
+             FROM engaged_ids
+             JOIN users ON users.id = engaged_ids.author_id
+             LEFT JOIN reply_counts ON reply_counts.author_id = engaged_ids.author_id
+             LEFT JOIN mention_counts ON mention_counts.author_id = engaged_ids.author_id
+             ORDER BY
+                 CASE ?2
+                     WHEN 'total' THEN COALESCE(reply_counts.replies, 0) + COALESCE(mention_counts.mentions, 0)
+                     WHEN 'replies' THEN COALESCE(reply_counts.replies, 0)
+                     WHEN 'mentions' THEN COALESCE(mention_counts.mentions, 0)
+                 END DESC,
+                 LOWER(TRIM(COALESCE(users.username, engaged_ids.author_id))) ASC,
+                 engaged_ids.author_id ASC
+             LIMIT ?3",
+        )
+        .map_err(StoreError::Sqlite)?;
+    let rows: Vec<(String, Option<String>, i64, i64)> = statement
+        .query_map(params![account_id.as_str(), sort, limit], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })
+        .map_err(StoreError::Sqlite)?
+        .collect::<std::result::Result<_, _>>()
+        .map_err(StoreError::Sqlite)?;
+
+    rows.into_iter()
+        .map(|(user_id, username, replies, mentions)| {
+            let replies = u64::try_from(replies).map_err(|_| {
+                StoreError::InvalidData("engagement reply count is negative".into())
+            })?;
+            let mentions = u64::try_from(mentions).map_err(|_| {
+                StoreError::InvalidData("engagement mention count is negative".into())
+            })?;
+            Ok(EngagedAccount {
+                user_id: UserId::new(user_id),
+                username,
+                replies,
+                mentions,
+                total: replies + mentions,
+            })
+        })
+        .collect()
+}
+
 /// Return up to `limit` posts ordered by `fetched_at DESC`. Used for
 /// enumeration (export / list) since FTS5 can't match "all posts" cleanly.
 pub fn list_posts(conn: &Connection, limit: usize) -> Result<Vec<Post>> {
@@ -974,34 +1062,38 @@ fn _edge_kind_from_str(s: &str) -> Option<EdgeKind> {
 /// `'@' || username` to `real_id`, then delete the placeholder user row.
 /// Idempotent.
 pub fn resolve_author(conn: &mut Connection, username: &str, real_id: &UserId) -> Result<()> {
-    let placeholder = format!("@{username}");
     let now = Utc::now().to_rfc3339();
     let tx = conn.transaction().map_err(StoreError::Sqlite)?;
 
-    // 1. Upsert the real user stub (preserves any existing richer row).
+    reconcile_author_tx(&tx, username, real_id, &now)?;
+
+    tx.commit().map_err(StoreError::Sqlite)?;
+    Ok(())
+}
+
+fn reconcile_author_tx(
+    tx: &Transaction,
+    username: &str,
+    real_id: &UserId,
+    now: &str,
+) -> Result<()> {
+    let placeholder = format!("@{username}");
     tx.execute(
         "INSERT INTO users (id, username, name, biography, profile_picture_url, updated_at)
          VALUES (?1, ?2, NULL, NULL, NULL, ?3)
          ON CONFLICT(id) DO UPDATE SET
-             username   = COALESCE(excluded.username, users.username),
+             username = excluded.username,
              updated_at = excluded.updated_at",
         params![real_id.as_str(), username, now],
     )
     .map_err(StoreError::Sqlite)?;
-
-    // 2. Rewrite posts authored under the placeholder (must precede the DELETE
-    //    so the FK cascade finds no rows still pointing at the placeholder).
     tx.execute(
         "UPDATE posts SET author_id = ?1 WHERE author_id = ?2",
         params![real_id.as_str(), &placeholder],
     )
     .map_err(StoreError::Sqlite)?;
-
-    // 3. Remove the now-orphaned placeholder user row.
     tx.execute("DELETE FROM users WHERE id = ?1", params![&placeholder])
         .map_err(StoreError::Sqlite)?;
-
-    tx.commit().map_err(StoreError::Sqlite)?;
     Ok(())
 }
 

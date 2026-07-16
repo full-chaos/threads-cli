@@ -3,7 +3,9 @@ use std::sync::Mutex;
 
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OpenFlags};
-use threads_core::model::{AudienceSnapshot, FetchRun, Post, PostId, User, UserId};
+use threads_core::model::{
+    AudienceSnapshot, EngagedAccount, EngagementSort, FetchRun, Post, PostId, User, UserId,
+};
 #[cfg(unix)]
 use tracing::warn;
 
@@ -181,6 +183,16 @@ impl Store {
     pub fn posts_by_author(&self, author: &threads_core::UserId) -> Result<Vec<PostId>> {
         let conn = self.conn.lock().unwrap();
         query::posts_by_author(&conn, author)
+    }
+
+    pub fn rank_engaged_accounts(
+        &self,
+        account_id: &UserId,
+        limit: usize,
+        sort: EngagementSort,
+    ) -> Result<Vec<EngagedAccount>> {
+        let conn = self.conn.lock().unwrap();
+        query::rank_engaged_accounts(&conn, account_id, limit, sort)
     }
 
     pub fn search_text(&self, query_str: &str, limit: usize) -> Result<Vec<Post>> {

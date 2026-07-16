@@ -5,8 +5,8 @@ mod tests {
     use rusqlite::params;
     use serde_json::json;
     use threads_core::model::{
-        AudienceSnapshot, DemographicBucket, DemographicDimension, FetchRun, Media, MediaKind,
-        Mention, Post, PostId, UrlEntity, User, UserId,
+        AudienceSnapshot, DemographicBucket, DemographicDimension, EngagementSort, FetchRun, Media,
+        MediaKind, Mention, Post, PostId, UrlEntity, User, UserId,
     };
 
     use crate::{PostKind, Store};
@@ -1222,5 +1222,323 @@ mod tests {
             "reply must be found under real id after resolution"
         );
         assert_eq!(after[0], PostId::new("reply_under_handle"));
+    }
+
+    #[test]
+    fn authoritative_post_upsert_reconciles_matching_handle_placeholder() {
+        // Given a post ingested before the provider knows Alice's real id.
+        let store = Store::open_in_memory().unwrap();
+        let mut placeholder = make_post("placeholder_post", "@alice");
+        placeholder.author_username = Some("alice".into());
+        store.upsert_post(&placeholder, None).unwrap();
+
+        // When an authoritative id/username pair arrives with another post.
+        let mut authoritative = make_post("authoritative_post", "alice-id");
+        authoritative.author_username = Some("alice".into());
+        store.upsert_post(&authoritative, None).unwrap();
+
+        // Then the matching placeholder is rewritten before the new post is stored.
+        assert_eq!(
+            store
+                .get_post(&PostId::new("placeholder_post"))
+                .unwrap()
+                .unwrap()
+                .author,
+            UserId::new("alice-id")
+        );
+        assert_eq!(
+            store
+                .posts_by_author(&UserId::new("alice-id"))
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn authoritative_username_changes_keep_real_ids_separate() {
+        // Given one real account changes its username and another real account
+        // later uses the former handle.
+        let store = Store::open_in_memory().unwrap();
+        let mut original = make_post("original", "first-id");
+        original.author_username = Some("shared-handle".into());
+        store.upsert_post(&original, None).unwrap();
+        let mut renamed = make_post("renamed", "first-id");
+        renamed.author_username = Some("first-new-name".into());
+        store.upsert_post(&renamed, None).unwrap();
+        let mut second = make_post("second", "second-id");
+        second.author_username = Some("shared-handle".into());
+
+        // When the second real id is persisted under the historical handle.
+        store.upsert_post(&second, None).unwrap();
+
+        // Then real ids are never merged based on display identity.
+        assert_eq!(
+            store
+                .get_post(&PostId::new("original"))
+                .unwrap()
+                .unwrap()
+                .author,
+            UserId::new("first-id")
+        );
+        assert_eq!(
+            store
+                .get_post(&PostId::new("second"))
+                .unwrap()
+                .unwrap()
+                .author,
+            UserId::new("second-id")
+        );
+    }
+
+    fn relationship_post(id: &str, author: &str) -> Post {
+        make_post(id, author)
+    }
+
+    #[test]
+    fn rank_engaged_accounts_counts_observed_relations_and_sorts_deterministically() {
+        // Given direct replies, nested replies, mention-only posts, dual-component
+        // posts, self activity, and alphabetical ties.
+        let store = Store::open_in_memory().unwrap();
+        let target = UserId::new("target");
+        let target_post = relationship_post("target-post", "target");
+        store.upsert_post(&target_post, None).unwrap();
+
+        for id in ["reply-one", "reply-two"] {
+            let mut post = relationship_post(id, "replier");
+            post.parent_id = Some(PostId::new("target-post"));
+            store.upsert_post(&post, None).unwrap();
+        }
+        let mut nested = relationship_post("nested", "nested-author");
+        nested.parent_id = Some(PostId::new("reply-one"));
+        store.upsert_post(&nested, None).unwrap();
+
+        for id in ["mention-one", "mention-two", "mention-three"] {
+            let mut post = relationship_post(id, "mentioner");
+            post.mentions = vec![Mention {
+                username: "target".into(),
+                user_id: Some(target.clone()),
+            }];
+            store.upsert_post(&post, None).unwrap();
+        }
+        let mut dual = relationship_post("dual", "dual-author");
+        dual.parent_id = Some(PostId::new("target-post"));
+        dual.mentions = vec![Mention {
+            username: "target".into(),
+            user_id: Some(target.clone()),
+        }];
+        store.upsert_post(&dual, None).unwrap();
+        let mut self_activity = relationship_post("self-activity", "target");
+        self_activity.parent_id = Some(PostId::new("target-post"));
+        self_activity.mentions = vec![Mention {
+            username: "target".into(),
+            user_id: Some(target.clone()),
+        }];
+        store.upsert_post(&self_activity, None).unwrap();
+        for (id, author, username) in [
+            ("alpha-mention", "alpha-id", "Alpha"),
+            ("beta-mention", "beta-id", "beta"),
+        ] {
+            let mut post = relationship_post(id, author);
+            post.author_username = Some(username.into());
+            post.mentions = vec![Mention {
+                username: "target".into(),
+                user_id: Some(target.clone()),
+            }];
+            store.upsert_post(&post, None).unwrap();
+        }
+
+        // When rankings are requested for each supported primary sort.
+        let total = store
+            .rank_engaged_accounts(&target, 10, EngagementSort::Total)
+            .unwrap();
+        let replies = store
+            .rank_engaged_accounts(&target, 10, EngagementSort::Replies)
+            .unwrap();
+        let mentions = store
+            .rank_engaged_accounts(&target, 10, EngagementSort::Mentions)
+            .unwrap();
+
+        // Then direct and mention components are independently distinct, self and
+        // nested activity are excluded, and ties use normalized display identity.
+        assert_eq!(
+            total
+                .iter()
+                .map(|account| account.user_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["mentioner", "dual-author", "replier", "alpha-id", "beta-id"]
+        );
+        assert_eq!(
+            total[1].replies, 1,
+            "the dual post contributes a direct reply"
+        );
+        assert_eq!(
+            total[1].mentions, 1,
+            "the dual post also contributes a mention"
+        );
+        assert_eq!(total[1].total, 2);
+        assert!(
+            total.iter().all(|account| account.user_id != target),
+            "self-authored activity is excluded"
+        );
+        assert!(
+            total
+                .iter()
+                .all(|account| account.user_id != UserId::new("nested-author")),
+            "a reply to another replier is not a direct reply to the target"
+        );
+        assert_eq!(
+            replies
+                .iter()
+                .map(|account| account.user_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["replier", "dual-author", "alpha-id", "beta-id", "mentioner"]
+        );
+        assert_eq!(
+            mentions
+                .iter()
+                .map(|account| account.user_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["mentioner", "alpha-id", "beta-id", "dual-author", "replier"]
+        );
+        assert_eq!(
+            store
+                .rank_engaged_accounts(&target, 2, EngagementSort::Total)
+                .unwrap()
+                .len(),
+            2,
+            "limit applies after deterministic ordering"
+        );
+    }
+
+    #[test]
+    fn rank_engaged_accounts_returns_empty_for_unobserved_account() {
+        // Given an account with no observed replies or targeted mentions.
+        let store = Store::open_in_memory().unwrap();
+
+        // When engagement is requested.
+        let ranked = store
+            .rank_engaged_accounts(&UserId::new("unobserved"), 10, EngagementSort::Total)
+            .unwrap();
+
+        // Then no inferred followers or quote-only activity appears.
+        assert!(ranked.is_empty());
+        assert!(
+            store
+                .rank_engaged_accounts(&UserId::new("unobserved"), 0, EngagementSort::Total)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .rank_engaged_accounts(
+                    &UserId::new("unobserved"),
+                    usize::MAX,
+                    EngagementSort::Total,
+                )
+                .is_err(),
+            "limits outside SQLite's signed range fail instead of wrapping"
+        );
+    }
+
+    #[test]
+    fn temp_db_qa_driver_prints_isolated_deterministic_rankings_and_cleans_up() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let database_path = temp_dir.path().join("t6-qa.sqlite");
+        let store = Store::open(&database_path).unwrap();
+        let target = UserId::new("qa-target");
+
+        let mut placeholder = relationship_post("qa-placeholder", "@shared");
+        placeholder.author_username = Some("shared".into());
+        store.upsert_post(&placeholder, None).unwrap();
+        let mut authoritative = relationship_post("qa-authoritative", "qa-first");
+        authoritative.author_username = Some("shared".into());
+        store.upsert_post(&authoritative, None).unwrap();
+        let mut historical_match = relationship_post("qa-second-real", "qa-second");
+        historical_match.author_username = Some("shared".into());
+        store.upsert_post(&historical_match, None).unwrap();
+
+        let target_post = relationship_post("qa-target-post", "qa-target");
+        store.upsert_post(&target_post, None).unwrap();
+        let mut direct_and_mentioned = relationship_post("qa-dual", "qa-first");
+        direct_and_mentioned.parent_id = Some(PostId::new("qa-target-post"));
+        direct_and_mentioned.mentions = vec![
+            Mention {
+                username: "qa-target".into(),
+                user_id: Some(target.clone()),
+            },
+            Mention {
+                username: "qa-target-duplicate".into(),
+                user_id: Some(target.clone()),
+            },
+        ];
+        store.upsert_post(&direct_and_mentioned, None).unwrap();
+        let mut nested = relationship_post("qa-nested", "qa-second");
+        nested.parent_id = Some(PostId::new("qa-dual"));
+        store.upsert_post(&nested, None).unwrap();
+        let mut mention_only = relationship_post("qa-mention-only", "qa-second");
+        mention_only.mentions = vec![Mention {
+            username: "qa-target".into(),
+            user_id: Some(target.clone()),
+        }];
+        store.upsert_post(&mention_only, None).unwrap();
+        let mut other_account_activity = relationship_post("qa-other-mention", "qa-other");
+        other_account_activity.mentions = vec![Mention {
+            username: "not-target".into(),
+            user_id: Some(UserId::new("other-target")),
+        }];
+        store.upsert_post(&other_account_activity, None).unwrap();
+
+        let render = |sort| {
+            store
+                .rank_engaged_accounts(&target, 10, sort)
+                .unwrap()
+                .into_iter()
+                .map(|account| {
+                    format!(
+                        "{}:{}:{}:{}",
+                        account.user_id, account.replies, account.mentions, account.total
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let total = render(EngagementSort::Total);
+        let replies = render(EngagementSort::Replies);
+        let mentions = render(EngagementSort::Mentions);
+        println!("T6_TEMP_DB_QA total={total:?}");
+        println!("T6_TEMP_DB_QA replies={replies:?}");
+        println!("T6_TEMP_DB_QA mentions={mentions:?}");
+        assert_eq!(total, vec!["qa-first:1:1:2", "qa-second:0:1:1"]);
+        assert_eq!(replies, vec!["qa-first:1:1:2", "qa-second:0:1:1"]);
+        assert_eq!(mentions, vec!["qa-first:1:1:2", "qa-second:0:1:1"]);
+        assert!(
+            store
+                .rank_engaged_accounts(&UserId::new("other-target"), 10, EngagementSort::Total)
+                .unwrap()
+                .iter()
+                .any(|account| account.user_id == UserId::new("qa-other")),
+            "account-scoped mentions remain isolated"
+        );
+        assert_eq!(
+            store
+                .get_post(&PostId::new("qa-placeholder"))
+                .unwrap()
+                .unwrap()
+                .author,
+            UserId::new("qa-first"),
+            "only the placeholder reconciles to the authoritative id"
+        );
+        assert_eq!(
+            store
+                .get_post(&PostId::new("qa-second-real"))
+                .unwrap()
+                .unwrap()
+                .author,
+            UserId::new("qa-second"),
+            "a matching historical username never merges real ids"
+        );
+        drop(store);
+        drop(temp_dir);
+        assert!(!database_path.exists(), "temporary QA database is removed");
     }
 }
