@@ -72,19 +72,15 @@ pub struct InsightsEnvelope {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct InsightDto {
     pub name: String,
-    #[serde(default)]
-    pub values: Vec<InsightValueDto>,
-    #[serde(default)]
-    pub total_value: Option<u64>,
-    #[serde(default)]
-    pub breakdowns: Vec<InsightBreakdownDto>,
+    pub total_value: TotalValueDto,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct InsightValueDto {
-    pub value: u64,
+pub struct TotalValueDto {
     #[serde(default)]
-    pub end_time: Option<String>,
+    pub value: Option<u64>,
+    #[serde(default)]
+    pub breakdowns: Vec<InsightBreakdownDto>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -105,7 +101,6 @@ pub struct InsightBreakdownResultDto {
 /// Pagination envelope: `{ data: [...], paging: { cursors: { before, after } } }`.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Envelope<T> {
-    #[serde(default = "Vec::new")]
     pub data: Vec<T>,
     #[serde(default)]
     pub paging: Option<Paging>,
@@ -192,6 +187,18 @@ mod tests {
     }
 
     #[test]
+    fn rejects_post_envelope_without_required_data() {
+        // Given: a response that omits the documented collection payload.
+        let missing_data = r#"{"paging":{"cursors":{"after":"CURSOR"}}}"#;
+
+        // When: it crosses the post-envelope boundary.
+        let result = serde_json::from_str::<Envelope<PostDto>>(missing_data);
+
+        // Then: it cannot become a misleading empty page.
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn parses_reply_post_with_root_and_replied_to() {
         let v = r#"{
             "id":"r1","text":"hi",
@@ -269,7 +276,7 @@ mod tests {
 
         // Then: the typed value remains available without raw JSON traversal.
         assert_eq!(insights.data[0].name, "followers_count");
-        assert_eq!(insights.data[0].values[0].value, 1234);
+        assert_eq!(insights.data[0].total_value.value, Some(1234));
     }
 
     #[test]
@@ -293,10 +300,67 @@ mod tests {
 
             // Then: its breakdown is typed with the documented dimension.
             assert_eq!(
-                insights.data[0].breakdowns[0].dimension_keys,
+                insights.data[0].total_value.breakdowns[0].dimension_keys,
                 vec![dimension.to_string()]
             );
         }
+    }
+
+    #[test]
+    fn accepts_total_value_followers_count_and_rejects_legacy_values() {
+        // Given: the documented Total Value envelope and the obsolete time-series shape.
+        let documented = r#"{
+            "data":[{
+                "name":"followers_count",
+                "total_value":{"value":1234}
+            }]
+        }"#;
+        let obsolete = r#"{
+            "data":[{
+                "name":"followers_count",
+                "values":[{"value":1234}]
+            }]
+        }"#;
+
+        // When: each payload crosses the insight DTO boundary.
+        let documented_result = serde_json::from_str::<InsightsEnvelope>(documented);
+        let obsolete_result = serde_json::from_str::<InsightsEnvelope>(obsolete);
+
+        // Then: only the documented Total Value envelope is accepted.
+        assert!(documented_result.is_ok());
+        assert!(obsolete_result.is_err());
+    }
+
+    #[test]
+    fn accepts_total_value_demographics_and_rejects_root_breakdowns() {
+        // Given: documented nested Total Value breakdowns and the obsolete root breakdown shape.
+        let documented = r#"{
+            "data":[{
+                "name":"follower_demographics",
+                "total_value":{"breakdowns":[{
+                    "dimension_keys":["country"],
+                    "results":[{"dimension_values":["US"],"value":900}]
+                }]}
+            }]
+        }"#;
+        let obsolete = r#"{
+            "data":[{
+                "name":"follower_demographics",
+                "total_value":900,
+                "breakdowns":[{
+                    "dimension_keys":["country"],
+                    "results":[{"dimension_values":["US"],"value":900}]
+                }]
+            }]
+        }"#;
+
+        // When: each payload crosses the insight DTO boundary.
+        let documented_result = serde_json::from_str::<InsightsEnvelope>(documented);
+        let obsolete_result = serde_json::from_str::<InsightsEnvelope>(obsolete);
+
+        // Then: only the documented nested Total Value shape is accepted.
+        assert!(documented_result.is_ok());
+        assert!(obsolete_result.is_err());
     }
 
     #[test]
@@ -306,7 +370,7 @@ mod tests {
             env!("CARGO_MANIFEST_DIR"),
             "/../threads-ingest/tests/fixtures/audience_malformed.json"
         ));
-        let noninteger = r#"{"data":[{"name":"followers_count","values":[{"value":"many"}]}]}"#;
+        let noninteger = r#"{"data":[{"name":"followers_count","total_value":{"value":"many"}}]}"#;
 
         // When: each response crosses the DTO boundary.
         let missing_data = serde_json::from_str::<InsightsEnvelope>(malformed);

@@ -1,19 +1,21 @@
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
 use threads_core::publish::{
-    ContainerId, ContainerStatus, MediaInput, MediaInputKind, PublishRequest, PublishingLimits,
+    ContainerId, ContainerStatus, MediaInput, PublishRequest, PublishingLimits,
 };
 use threads_core::{
-    AudienceInsightQuery, AudienceInsightResult, AudienceSnapshot, Cursor, DemographicBucket,
-    DemographicDimension, Error, Media, MediaKind, Page, Post, PostId, Provider, Result, User,
-    UserId,
+    AudienceInsightQuery, AudienceInsightResult, Cursor, Page, Post, PostId, Provider, Result,
+    User, UserId,
 };
 use threads_manifest::Manifest;
 
-use crate::{
-    client::HttpClient,
-    dto::{Envelope, InsightDto, InsightsEnvelope, MeDto, PostDto},
-};
+use crate::client::HttpClient;
+
+mod audience;
+mod paths;
+mod posts;
+mod publish_params;
+mod publishing;
+mod reads;
 
 pub struct OfficialProvider {
     pub(crate) http: HttpClient,
@@ -25,136 +27,35 @@ impl OfficialProvider {
         Self { http, manifest }
     }
 
-    fn endpoint_fields(&self, key: &str) -> Option<String> {
-        let fields = self
-            .manifest
-            .edges
-            .iter()
-            .find(|e| e.name == key)
-            .map(|e| &e.fields)
-            .or_else(|| {
-                self.manifest
-                    .objects
-                    .iter()
-                    .find(|o| o.name == key)
-                    .map(|o| &o.fields)
-            })?;
-        if fields.is_empty() {
-            None
-        } else {
-            Some(fields.join(","))
-        }
+    pub(super) fn endpoint_fields(&self, key: &str) -> Option<String> {
+        paths::endpoint_fields(&self.manifest, key)
     }
 
-    fn object_path(&self, key: &str) -> Option<String> {
-        self.manifest
-            .objects
-            .iter()
-            .find(|o| o.name == key)
-            .map(|o| o.path.clone())
+    pub(super) fn object_path(&self, key: &str) -> Option<String> {
+        paths::object_path(&self.manifest, key)
     }
 
-    fn edge_path(&self, key: &str) -> Option<String> {
-        self.manifest
-            .edges
-            .iter()
-            .find(|e| e.name == key)
-            .map(|e| e.path.clone())
+    pub(super) fn edge_path(&self, key: &str) -> Option<String> {
+        paths::edge_path(&self.manifest, key)
     }
 
-    fn action_path(&self, key: &str) -> Option<String> {
-        self.manifest
-            .actions
-            .iter()
-            .find(|a| a.name == key)
-            .map(|a| a.path.clone())
+    pub(super) fn action_path(&self, key: &str) -> Option<String> {
+        paths::action_path(&self.manifest, key)
     }
 
-    fn substitute_post_id(path: &str, post_id: &PostId) -> String {
+    pub(super) fn substitute_post_id(path: &str, post_id: &PostId) -> String {
         // Delete actions use either `{post-id}` or `{reply-id}` for the same
         // media-object id slot, so one helper substitutes both placeholders.
-        path.replace("{post-id}", post_id.as_str())
-            .replace("{reply-id}", post_id.as_str())
+        paths::substitute_post_id(path, post_id)
     }
 
-    fn substitute_user_id(path: &str, user_id: &UserId) -> String {
-        path.replace("{threads-user-id}", user_id.as_str())
+    pub(super) fn substitute_user_id(path: &str, user_id: &UserId) -> String {
+        paths::substitute_user_id(path, user_id)
     }
 
     pub(crate) fn substitute_container_id(path: &str, id: &ContainerId) -> String {
-        path.replace("{container-id}", id.as_str())
+        paths::substitute_container_id(path, id)
     }
-}
-
-/// Build the query-string params for `POST /v1.0/me/threads`.
-/// All values are owned Strings because lifetimes from the request fields
-/// need to outlive the params slice passed to `post_json`.
-pub(crate) fn build_create_params(req: &PublishRequest) -> Vec<(&'static str, String)> {
-    let mut p: Vec<(&'static str, String)> = Vec::new();
-    p.push(("media_type", req.media_type.as_wire_str().to_string()));
-    if let Some(ref text) = req.text {
-        p.push(("text", text.clone()));
-    }
-    if let Some(ref rid) = req.reply_to_id {
-        p.push(("reply_to_id", rid.as_str().to_string()));
-    }
-    if let Some(ref rc) = req.reply_control {
-        p.push(("reply_control", rc.as_wire_str().to_string()));
-    }
-    if let Some(ref la) = req.link_attachment {
-        p.push(("link_attachment", la.clone()));
-    }
-    for m in &req.media {
-        match m.kind {
-            MediaInputKind::Image => p.push(("image_url", m.url.clone())),
-            MediaInputKind::Video => p.push(("video_url", m.url.clone())),
-        }
-    }
-    p
-}
-
-/// Build the query-string params for one carousel CHILD container.
-/// Always sets `is_carousel_item=true`.
-pub(crate) fn build_carousel_item_params(item: &MediaInput) -> Vec<(&'static str, String)> {
-    let mut p: Vec<(&'static str, String)> = Vec::new();
-    match item.kind {
-        MediaInputKind::Image => {
-            p.push(("media_type", "IMAGE".to_string()));
-            p.push(("image_url", item.url.clone()));
-        }
-        MediaInputKind::Video => {
-            p.push(("media_type", "VIDEO".to_string()));
-            p.push(("video_url", item.url.clone()));
-        }
-    }
-    p.push(("is_carousel_item", "true".to_string()));
-    p
-}
-
-/// Build the query-string params for the carousel PARENT container.
-/// `children` is the comma-separated list of already-created child container ids.
-pub(crate) fn build_carousel_parent_params(
-    req: &PublishRequest,
-    children: &[ContainerId],
-) -> Vec<(&'static str, String)> {
-    let mut p: Vec<(&'static str, String)> = Vec::new();
-    p.push(("media_type", "CAROUSEL".to_string()));
-    if let Some(ref text) = req.text {
-        p.push(("text", text.clone()));
-    }
-    if let Some(ref rid) = req.reply_to_id {
-        p.push(("reply_to_id", rid.as_str().to_string()));
-    }
-    if let Some(ref rc) = req.reply_control {
-        p.push(("reply_control", rc.as_wire_str().to_string()));
-    }
-    let csv = children
-        .iter()
-        .map(|c| c.as_str())
-        .collect::<Vec<_>>()
-        .join(",");
-    p.push(("children", csv));
-    p
 }
 
 #[async_trait]
@@ -164,58 +65,15 @@ impl Provider for OfficialProvider {
     }
 
     async fn fetch_me(&self) -> Result<User> {
-        let path = self
-            .object_path("me")
-            .ok_or_else(|| Error::Manifest("missing object `me`".into()))?;
-        let fields = self.endpoint_fields("me");
-        let mut q: Vec<(&str, &str)> = Vec::new();
-        if let Some(ref f) = fields {
-            q.push(("fields", f.as_str()));
-        }
-        let dto: MeDto = self.http.get_json(&path, &q).await?;
-        Ok(User {
-            id: UserId::new(dto.id),
-            username: dto.username,
-            name: dto.name,
-            biography: dto.threads_biography,
-            profile_picture_url: dto.threads_profile_picture_url,
-        })
+        reads::fetch_me(self).await
     }
 
     async fn fetch_my_threads(&self, cursor: Option<Cursor>) -> Result<Page<Post>> {
-        let path = self
-            .edge_path("me/threads")
-            .ok_or_else(|| Error::Manifest("missing edge `me/threads`".into()))?;
-        let fields = self.endpoint_fields("me/threads");
-        let mut q: Vec<(&str, &str)> = Vec::new();
-        if let Some(ref f) = fields {
-            q.push(("fields", f.as_str()));
-        }
-        let cur: String;
-        if let Some(c) = cursor {
-            cur = c.0;
-            q.push(("after", cur.as_str()));
-        }
-        let env: Envelope<PostDto> = self.http.get_json(&path, &q).await?;
-        Ok(envelope_to_page(env, None))
+        reads::fetch_my_threads(self, cursor).await
     }
 
     async fn fetch_my_replies(&self, cursor: Option<Cursor>) -> Result<Page<Post>> {
-        let path = self
-            .edge_path("me/replies")
-            .ok_or_else(|| Error::Manifest("missing edge `me/replies`".into()))?;
-        let fields = self.endpoint_fields("me/replies");
-        let mut q: Vec<(&str, &str)> = Vec::new();
-        if let Some(ref f) = fields {
-            q.push(("fields", f.as_str()));
-        }
-        let cur: String;
-        if let Some(c) = cursor {
-            cur = c.0;
-            q.push(("after", cur.as_str()));
-        }
-        let env: Envelope<PostDto> = self.http.get_json(&path, &q).await?;
-        Ok(envelope_to_page(env, None))
+        reads::fetch_my_replies(self, cursor).await
     }
 
     async fn fetch_audience_insight(
@@ -223,17 +81,7 @@ impl Provider for OfficialProvider {
         user_id: &UserId,
         query: AudienceInsightQuery,
     ) -> Result<AudienceInsightResult> {
-        let path = self
-            .object_path("user/insights")
-            .ok_or_else(|| Error::Manifest("missing object `user/insights`".into()))?;
-        let path = Self::substitute_user_id(&path, user_id);
-        let owned_params = audience_insight_params(&query);
-        let params: Vec<(&str, &str)> = owned_params
-            .iter()
-            .map(|(key, value)| (*key, value.as_str()))
-            .collect();
-        let insights: InsightsEnvelope = self.http.get_json(&path, &params).await?;
-        insight_to_result(insights, user_id, query)
+        audience::fetch_insight(self, user_id, query).await
     }
 
     async fn fetch_mentions(
@@ -242,194 +90,53 @@ impl Provider for OfficialProvider {
         cursor: Option<Cursor>,
         _limit: usize,
     ) -> Result<Page<Post>> {
-        let path = self
-            .edge_path("user/mentions")
-            .ok_or_else(|| Error::Manifest("missing edge `user/mentions`".into()))?;
-        let path = Self::substitute_user_id(&path, user_id);
-        let fields = self.endpoint_fields("user/mentions");
-        let mut params: Vec<(&str, &str)> = vec![("limit", "100")];
-        if let Some(ref fields) = fields {
-            params.push(("fields", fields));
-        }
-        let after;
-        if let Some(cursor) = cursor {
-            after = cursor.0;
-            params.push(("after", &after));
-        }
-        let mentions: Envelope<PostDto> = self.http.get_json(&path, &params).await?;
-        Ok(envelope_to_page(mentions, None))
+        reads::fetch_mentions(self, user_id, cursor).await
     }
 
     async fn fetch_replies(&self, post_id: &PostId, cursor: Option<Cursor>) -> Result<Page<Post>> {
-        let path = self
-            .edge_path("post/replies")
-            .ok_or_else(|| Error::Manifest("missing edge `post/replies`".into()))?;
-        let path = Self::substitute_post_id(&path, post_id);
-        let fields = self.endpoint_fields("post/replies");
-        let mut q: Vec<(&str, &str)> = Vec::new();
-        if let Some(ref f) = fields {
-            q.push(("fields", f.as_str()));
-        }
-        let cur: String;
-        if let Some(c) = cursor {
-            cur = c.0;
-            q.push(("after", cur.as_str()));
-        }
-        let env: Envelope<PostDto> = self.http.get_json(&path, &q).await?;
-        Ok(envelope_to_page(env, Some(post_id)))
+        reads::fetch_replies(self, post_id, cursor).await
     }
 
     async fn fetch_thread(&self, root_id: &PostId) -> Result<Vec<Post>> {
-        let path = self
-            .edge_path("post/conversation")
-            .ok_or_else(|| Error::Manifest("missing edge `post/conversation`".into()))?;
-        let path = Self::substitute_post_id(&path, root_id);
-        let fields = self.endpoint_fields("post/conversation");
-        let mut q: Vec<(&str, &str)> = Vec::new();
-        if let Some(ref f) = fields {
-            q.push(("fields", f.as_str()));
-        }
-        let mut out = Vec::new();
-        let mut cursor: Option<String> = None;
-        loop {
-            let mut qq = q.clone();
-            if let Some(ref c) = cursor {
-                qq.push(("after", c.as_str()));
-            }
-            let env: Envelope<PostDto> = self.http.get_json(&path, &qq).await?;
-            let page = envelope_to_page(env, Some(root_id));
-            out.extend(page.items);
-            match page.next {
-                Some(next) => cursor = Some(next.0),
-                None => break,
-            }
-        }
-        Ok(out)
+        reads::fetch_thread(self, root_id).await
     }
 
     async fn delete_post(&self, post_id: &PostId) -> Result<()> {
-        let path = self
-            .action_path("post/delete")
-            .ok_or_else(|| Error::Manifest("missing action `post/delete`".into()))?;
-        let path = Self::substitute_post_id(&path, post_id);
-        // Threads API may return {"success": true} or just 200; we don't care.
-        let _ = self.http.delete_json(&path, &[]).await?;
-        Ok(())
+        publishing::delete_post(self, post_id).await
     }
 
     async fn delete_reply(&self, reply_id: &PostId) -> Result<()> {
-        let path = self
-            .action_path("reply/delete")
-            .ok_or_else(|| Error::Manifest("missing action `reply/delete`".into()))?;
-        let path = Self::substitute_post_id(&path, reply_id);
-        let _ = self.http.delete_json(&path, &[]).await?;
-        Ok(())
+        publishing::delete_reply(self, reply_id).await
     }
 
     async fn create_container(&self, req: &PublishRequest) -> threads_core::Result<ContainerId> {
-        let path = self
-            .action_path("post/create")
-            .ok_or_else(|| Error::Manifest("missing action `post/create`".into()))?;
-        let owned_params = build_create_params(req);
-        let borrowed: Vec<(&str, &str)> =
-            owned_params.iter().map(|(k, v)| (*k, v.as_str())).collect();
-        let val = self.http.post_json(&path, &borrowed).await?;
-        let resp: crate::dto::CreateContainerResp =
-            serde_json::from_value(val).map_err(threads_core::Error::from)?;
-        Ok(ContainerId::new(resp.id))
+        publishing::create_container(self, req).await
     }
 
     async fn publish_container(
         &self,
         id: &ContainerId,
     ) -> threads_core::Result<threads_core::PostId> {
-        let path = self
-            .action_path("post/publish")
-            .ok_or_else(|| Error::Manifest("missing action `post/publish`".into()))?;
-        let creation_id = id.as_str().to_string();
-        let params: Vec<(&str, &str)> = vec![("creation_id", creation_id.as_str())];
-        let val = self.http.post_json(&path, &params).await?;
-        let resp: crate::dto::PublishResp =
-            serde_json::from_value(val).map_err(threads_core::Error::from)?;
-        Ok(threads_core::PostId::new(resp.id))
+        publishing::publish_container(self, id).await
     }
 
     async fn container_status(&self, id: &ContainerId) -> threads_core::Result<ContainerStatus> {
-        let path = self
-            .object_path("container")
-            .ok_or_else(|| Error::Manifest("missing object `container`".into()))?;
-        let path = Self::substitute_container_id(&path, id);
-        let fields = self
-            .endpoint_fields("container")
-            .unwrap_or_else(|| "status".into());
-        let val: serde_json::Value = self
-            .http
-            .get_json(&path, &[("fields", fields.as_str())])
-            .await?;
-        let resp: crate::dto::ContainerStatusResp =
-            serde_json::from_value(val).map_err(threads_core::Error::from)?;
-        ContainerStatus::from_wire(&resp.status).ok_or_else(|| {
-            threads_core::Error::Parse(format!("unknown container status: {}", resp.status))
-        })
+        publishing::container_status(self, id).await
     }
 
     async fn publishing_limits(&self) -> threads_core::Result<PublishingLimits> {
-        let path = self
-            .object_path("publishing_limit")
-            .ok_or_else(|| Error::Manifest("missing object `publishing_limit`".into()))?;
-        let fields = self
-            .endpoint_fields("publishing_limit")
-            .unwrap_or_else(|| "quota_usage,config,reply_quota_usage,reply_config".into());
-        // The API may return a `{ "data": [ { ... } ] }` envelope.
-        let raw: serde_json::Value = self
-            .http
-            .get_json(&path, &[("fields", fields.as_str())])
-            .await?;
-        let item = if let Some(arr) = raw.get("data").and_then(|d| d.as_array()) {
-            arr.first().cloned().ok_or_else(|| {
-                threads_core::Error::Parse("publishing_limit data array is empty".into())
-            })?
-        } else {
-            raw
-        };
-        let resp: crate::dto::PublishingLimitResp =
-            serde_json::from_value(item).map_err(threads_core::Error::from)?;
-        Ok(PublishingLimits {
-            post_usage: resp.quota_usage,
-            post_total: resp.config.quota_total,
-            reply_usage: resp.reply_quota_usage,
-            reply_total: resp.reply_config.quota_total,
-        })
+        publishing::publishing_limits(self).await
     }
 
     async fn fetch_post(
         &self,
         id: &threads_core::PostId,
     ) -> threads_core::Result<threads_core::Post> {
-        let path = self
-            .object_path("post")
-            .ok_or_else(|| Error::Manifest("missing object `post`".into()))?;
-        let path = Self::substitute_post_id(&path, id);
-        let fields = self.endpoint_fields("post");
-        let mut q: Vec<(&str, &str)> = Vec::new();
-        if let Some(ref f) = fields {
-            q.push(("fields", f.as_str()));
-        }
-        let dto: crate::dto::PostDto = self.http.get_json(&path, &q).await?;
-        Ok(dto_to_post(dto, None))
+        reads::fetch_post(self, id).await
     }
 
     async fn create_carousel_item(&self, item: &MediaInput) -> threads_core::Result<ContainerId> {
-        let path = self
-            .action_path("post/create")
-            .ok_or_else(|| threads_core::Error::Manifest("missing action `post/create`".into()))?;
-        let owned_params = build_carousel_item_params(item);
-        let borrowed: Vec<(&str, &str)> =
-            owned_params.iter().map(|(k, v)| (*k, v.as_str())).collect();
-        let val = self.http.post_json(&path, &borrowed).await?;
-        let resp: crate::dto::CreateContainerResp =
-            serde_json::from_value(val).map_err(threads_core::Error::from)?;
-        Ok(ContainerId::new(resp.id))
+        publishing::create_carousel_item(self, item).await
     }
 
     async fn create_carousel_container(
@@ -437,231 +144,18 @@ impl Provider for OfficialProvider {
         req: &PublishRequest,
         children: &[ContainerId],
     ) -> threads_core::Result<ContainerId> {
-        let path = self
-            .action_path("post/create")
-            .ok_or_else(|| threads_core::Error::Manifest("missing action `post/create`".into()))?;
-        let owned_params = build_carousel_parent_params(req, children);
-        let borrowed: Vec<(&str, &str)> =
-            owned_params.iter().map(|(k, v)| (*k, v.as_str())).collect();
-        let val = self.http.post_json(&path, &borrowed).await?;
-        let resp: crate::dto::CreateContainerResp =
-            serde_json::from_value(val).map_err(threads_core::Error::from)?;
-        Ok(ContainerId::new(resp.id))
+        publishing::create_carousel_container(self, req, children).await
     }
-}
-
-fn audience_insight_params(query: &AudienceInsightQuery) -> Vec<(&'static str, String)> {
-    match query {
-        AudienceInsightQuery::FollowersCount => vec![("metric", "followers_count".into())],
-        AudienceInsightQuery::FollowerDemographics(dimension) => vec![
-            ("metric", "follower_demographics".into()),
-            ("breakdown", demographic_dimension_wire(dimension).into()),
-        ],
-    }
-}
-
-fn insight_to_result(
-    insights: InsightsEnvelope,
-    user_id: &UserId,
-    query: AudienceInsightQuery,
-) -> Result<AudienceInsightResult> {
-    let expected_name = audience_query_metric(&query);
-    let insight = insights
-        .data
-        .into_iter()
-        .find(|insight| insight.name == expected_name)
-        .ok_or_else(|| Error::Parse(format!("missing {expected_name} insight data")))?;
-
-    match query {
-        AudienceInsightQuery::FollowersCount => followers_count_result(insight),
-        AudienceInsightQuery::FollowerDemographics(dimension) => {
-            demographics_result(insight, user_id, dimension)
-        }
-    }
-}
-
-const fn audience_query_metric(query: &AudienceInsightQuery) -> &'static str {
-    match query {
-        AudienceInsightQuery::FollowersCount => "followers_count",
-        AudienceInsightQuery::FollowerDemographics(_) => "follower_demographics",
-    }
-}
-
-const fn demographic_dimension_wire(dimension: &DemographicDimension) -> &'static str {
-    match dimension {
-        DemographicDimension::Country => "country",
-        DemographicDimension::City => "city",
-        DemographicDimension::Age => "age",
-        DemographicDimension::Gender => "gender",
-    }
-}
-
-fn followers_count_result(insight: InsightDto) -> Result<AudienceInsightResult> {
-    let value = insight
-        .values
-        .first()
-        .map(|value| value.value)
-        .ok_or_else(|| Error::Parse("followers_count insight is missing a value".into()))?;
-    Ok(AudienceInsightResult::FollowersCount(value))
-}
-
-fn demographics_result(
-    insight: InsightDto,
-    user_id: &UserId,
-    dimension: DemographicDimension,
-) -> Result<AudienceInsightResult> {
-    let expected_dimension = demographic_dimension_wire(&dimension);
-    let [breakdown] = insight.breakdowns.as_slice() else {
-        return Err(Error::Parse(
-            "follower_demographics insight is missing one breakdown".into(),
-        ));
-    };
-    if breakdown.dimension_keys.as_slice() != [expected_dimension] {
-        return Err(Error::Parse(format!(
-            "follower_demographics breakdown does not match {expected_dimension}"
-        )));
-    }
-    let buckets = breakdown
-        .results
-        .iter()
-        .map(|result| {
-            let bucket = result.dimension_values.first().cloned().ok_or_else(|| {
-                Error::Parse("follower_demographics result is missing a dimension value".into())
-            })?;
-            Ok(DemographicBucket {
-                dimension,
-                bucket,
-                value: result.value,
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let followers_count = insight.total_value.ok_or_else(|| {
-        Error::Parse("follower_demographics insight is missing total_value".into())
-    })?;
-    Ok(AudienceInsightResult::Demographics(AudienceSnapshot {
-        account_id: user_id.clone(),
-        observed_at: Utc::now(),
-        followers_count,
-        demographics: buckets,
-    }))
-}
-
-pub(crate) fn envelope_to_page(env: Envelope<PostDto>, root_hint: Option<&PostId>) -> Page<Post> {
-    let items = env
-        .data
-        .into_iter()
-        .map(|dto| dto_to_post(dto, root_hint))
-        .collect();
-    let next = env
-        .paging
-        .and_then(|p| p.cursors)
-        .and_then(|c| c.after)
-        .map(Cursor);
-    Page { items, next }
-}
-
-pub(crate) fn dto_to_post(dto: PostDto, root_hint: Option<&PostId>) -> Post {
-    let raw = serde_json::to_value(&dto).ok();
-    let created_at = dto.timestamp.as_deref().and_then(parse_timestamp);
-    // `@`-prefix marks a synthesized/sparse author (no `owner` in the DTO).
-    // Callers can detect it via `starts_with('@')` and resolve later.
-    let author = dto
-        .owner
-        .as_ref()
-        .map(|o| UserId::new(&o.id))
-        .or_else(|| {
-            dto.username
-                .as_deref()
-                .map(|u| UserId::new(format!("@{u}")))
-        })
-        .unwrap_or_else(|| UserId::new(""));
-    let parent_id = dto.replied_to.as_ref().map(|r| PostId::new(&r.id));
-    let root_id = dto
-        .root_post
-        .as_ref()
-        .map(|r| PostId::new(&r.id))
-        .or_else(|| root_hint.cloned());
-    let media = collect_media(&dto);
-    Post {
-        id: PostId::new(dto.id),
-        author,
-        author_username: dto.username.clone(),
-        text: dto.text,
-        created_at,
-        parent_id,
-        root_id,
-        permalink: dto.permalink,
-        media,
-        urls: vec![],
-        mentions: vec![],
-        is_quote_post: dto.is_quote_post,
-        raw,
-    }
-}
-
-fn collect_media(dto: &PostDto) -> Vec<Media> {
-    let kind = match dto.media_type.as_deref() {
-        Some("IMAGE") => MediaKind::Image,
-        Some("VIDEO") => MediaKind::Video,
-        Some("CAROUSEL_ALBUM") => MediaKind::Carousel,
-        Some("AUDIO") => MediaKind::Audio,
-        Some("TEXT_POST") | None => return collect_children_media(dto),
-        _ => MediaKind::Unknown,
-    };
-    if matches!(kind, MediaKind::Carousel) {
-        let mut v = vec![Media {
-            kind,
-            url: dto.media_url.clone(),
-            thumbnail_url: dto.thumbnail_url.clone(),
-        }];
-        v.extend(collect_children_media(dto));
-        v
-    } else {
-        vec![Media {
-            kind,
-            url: dto.media_url.clone(),
-            thumbnail_url: dto.thumbnail_url.clone(),
-        }]
-    }
-}
-
-fn collect_children_media(dto: &PostDto) -> Vec<Media> {
-    let Some(children) = &dto.children else {
-        return vec![];
-    };
-    children
-        .data
-        .iter()
-        .map(|child| Media {
-            kind: match child.media_type.as_deref() {
-                Some("IMAGE") => MediaKind::Image,
-                Some("VIDEO") => MediaKind::Video,
-                Some("AUDIO") => MediaKind::Audio,
-                _ => MediaKind::Unknown,
-            },
-            url: child.media_url.clone(),
-            thumbnail_url: child.thumbnail_url.clone(),
-        })
-        .collect()
-}
-
-fn parse_timestamp(s: &str) -> Option<DateTime<Utc>> {
-    // Meta's Threads API returns timestamps as `2026-04-24T18:15:44+0000` —
-    // valid ISO 8601 but NOT RFC 3339 (which mandates a colon in the TZ
-    // offset). Try RFC 3339 first, then fall back to the colonless form.
-    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
-        return Some(dt.with_timezone(&Utc));
-    }
-    if let Ok(dt) = DateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%z") {
-        return Some(dt.with_timezone(&Utc));
-    }
-    None
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::client::HttpClient;
+    use crate::{
+        client::HttpClient,
+        dto::{Envelope, InsightsEnvelope, PostDto},
+    };
+    use threads_core::{DemographicDimension, Error};
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
@@ -727,7 +221,7 @@ mod tests {
             link_attachment: None,
             media: vec![],
         };
-        let params = build_create_params(&req);
+        let params = publish_params::create(&req);
         let map: std::collections::HashMap<&str, &str> =
             params.iter().map(|(k, v)| (*k, v.as_str())).collect();
         assert_eq!(map.get("media_type").copied(), Some("TEXT"));
@@ -749,7 +243,7 @@ mod tests {
             link_attachment: None,
             media: vec![],
         };
-        let params = build_create_params(&req);
+        let params = publish_params::create(&req);
         let map: std::collections::HashMap<&str, &str> =
             params.iter().map(|(k, v)| (*k, v.as_str())).collect();
         assert_eq!(map.get("reply_to_id").copied(), Some("parent_post_99"));
@@ -769,7 +263,7 @@ mod tests {
                 url: "https://example.com/photo.jpg".into(),
             }],
         };
-        let params = build_create_params(&req);
+        let params = publish_params::create(&req);
         let map: std::collections::HashMap<&str, &str> =
             params.iter().map(|(k, v)| (*k, v.as_str())).collect();
         assert_eq!(map.get("media_type").copied(), Some("IMAGE"));
@@ -795,7 +289,7 @@ mod tests {
             kind: MediaInputKind::Image,
             url: "https://example.com/img.jpg".into(),
         };
-        let params = build_carousel_item_params(&item);
+        let params = publish_params::carousel_item(&item);
         let map: std::collections::HashMap<&str, &str> =
             params.iter().map(|(k, v)| (*k, v.as_str())).collect();
         assert_eq!(map.get("media_type").copied(), Some("IMAGE"));
@@ -821,7 +315,7 @@ mod tests {
             media: vec![],
         };
         let children = vec![ContainerId::new("ctr_1"), ContainerId::new("ctr_2")];
-        let params = build_carousel_parent_params(&req, &children);
+        let params = publish_params::carousel_parent(&req, &children);
         let map: std::collections::HashMap<&str, &str> =
             params.iter().map(|(k, v)| (*k, v.as_str())).collect();
         assert_eq!(map.get("media_type").copied(), Some("CAROUSEL"));
@@ -849,7 +343,7 @@ mod tests {
             is_reply: None,
             shortcode: None,
         };
-        let post = dto_to_post(dto, None);
+        let post = posts::dto_to_post(dto, None).expect("username is a valid sparse author");
         assert_eq!(post.id, PostId::new("p1"));
         assert_eq!(post.author, UserId::new("@alice"));
         assert_eq!(post.author_username.as_deref(), Some("alice"));
@@ -876,7 +370,8 @@ mod tests {
             is_reply: Some(true),
             shortcode: None,
         };
-        let post = dto_to_post(dto, Some(&PostId::new("root-x")));
+        let post = posts::dto_to_post(dto, Some(&PostId::new("root-x")))
+            .expect("username is a valid sparse author");
         assert_eq!(post.parent_id, Some(PostId::new("parent")));
         assert_eq!(post.root_id, Some(PostId::new("root-x")));
     }
@@ -885,20 +380,20 @@ mod tests {
     fn parse_timestamp_accepts_meta_format() {
         // Meta returns `+0000` (no colon), which is valid ISO 8601 but not
         // RFC 3339. chrono's strict RFC 3339 parser rejects it.
-        let ts = parse_timestamp("2026-04-24T18:15:44+0000").unwrap();
+        let ts = posts::parse_timestamp("2026-04-24T18:15:44+0000").unwrap();
         assert_eq!(ts.to_rfc3339(), "2026-04-24T18:15:44+00:00");
     }
 
     #[test]
     fn parse_timestamp_accepts_rfc3339() {
-        let ts = parse_timestamp("2026-04-24T18:15:44+00:00").unwrap();
+        let ts = posts::parse_timestamp("2026-04-24T18:15:44+00:00").unwrap();
         assert_eq!(ts.to_rfc3339(), "2026-04-24T18:15:44+00:00");
     }
 
     #[test]
     fn parse_timestamp_rejects_garbage() {
-        assert!(parse_timestamp("not a date").is_none());
-        assert!(parse_timestamp("").is_none());
+        assert!(posts::parse_timestamp("not a date").is_none());
+        assert!(posts::parse_timestamp("").is_none());
     }
 
     #[test]
@@ -907,9 +402,24 @@ mod tests {
             r#"{"data":[{"id":"1","username":"u"}],"paging":{"cursors":{"after":"NXT"}}}"#,
         )
         .unwrap();
-        let page = envelope_to_page(env, None);
+        let page = posts::envelope_to_page(env, None).expect("fixture has a post author");
         assert_eq!(page.items.len(), 1);
         assert_eq!(page.next.as_ref().map(|c| c.0.as_str()), Some("NXT"));
+    }
+
+    #[test]
+    fn envelope_to_page_extracts_after_cursor_from_next_url() {
+        // Given: an official pagination response that provides only its next URL.
+        let env: Envelope<PostDto> = serde_json::from_str(
+            r#"{"data":[{"id":"1","username":"u"}],"paging":{"next":"https://graph.threads.net/v1.0/me/threads?after=NXT"}}"#,
+        )
+        .unwrap();
+
+        // When: the response is converted to the core page.
+        let page = posts::envelope_to_page(env, None).expect("fixture has a post author");
+
+        // Then: the documented continuation cursor is preserved.
+        assert_eq!(page.next, Some(Cursor("NXT".into())));
     }
 
     #[test]
@@ -923,8 +433,43 @@ mod tests {
     }
 
     #[test]
+    fn substitutes_identifiers_as_percent_encoded_path_segments() {
+        // Given: identifiers containing path and query delimiters.
+        let post_id = PostId::new("post/one?two#three%");
+        let user_id = UserId::new("user/one?two#three%");
+        let container_id = ContainerId::new("container/one?two#three%");
+
+        // When: each identifier is substituted into its manifest path.
+        let post_path = OfficialProvider::substitute_post_id("/v1.0/{post-id}/replies", &post_id);
+        let reply_path = OfficialProvider::substitute_post_id("/v1.0/{reply-id}", &post_id);
+        let user_path =
+            OfficialProvider::substitute_user_id("/v1.0/{threads-user-id}/mentions", &user_id);
+        let container_path =
+            OfficialProvider::substitute_container_id("/v1.0/{container-id}", &container_id);
+
+        // Then: every substituted value remains one path segment.
+        assert_eq!(post_path, "/v1.0/post%2Fone%3Ftwo%23three%25/replies");
+        assert_eq!(reply_path, "/v1.0/post%2Fone%3Ftwo%23three%25");
+        assert_eq!(user_path, "/v1.0/user%2Fone%3Ftwo%23three%25/mentions");
+        assert_eq!(container_path, "/v1.0/container%2Fone%3Ftwo%23three%25");
+    }
+
+    #[test]
+    fn substitutes_spaces_plus_percent_and_unicode_as_path_segment_bytes() {
+        // Given: an identifier with characters whose form encoding differs from a URL path.
+        let user_id = UserId::new("a b+c%/✓");
+
+        // When: it fills the documented versioned path.
+        let path =
+            OfficialProvider::substitute_user_id("/v1.0/{threads-user-id}/mentions", &user_id);
+
+        // Then: every non-unreserved byte is percent encoded, never form encoded.
+        assert_eq!(path, "/v1.0/a%20b%2Bc%25%2F%E2%9C%93/mentions");
+    }
+
+    #[test]
     fn builds_only_documented_audience_queries() {
-        let count = audience_insight_params(&AudienceInsightQuery::FollowersCount);
+        let count = audience::insight_params(&AudienceInsightQuery::FollowersCount);
         assert_eq!(count, [("metric", "followers_count".to_string())]);
 
         for (dimension, wire) in [
@@ -934,7 +479,7 @@ mod tests {
             (DemographicDimension::Gender, "gender"),
         ] {
             let demographics =
-                audience_insight_params(&AudienceInsightQuery::FollowerDemographics(dimension));
+                audience::insight_params(&AudienceInsightQuery::FollowerDemographics(dimension));
             assert_eq!(
                 demographics,
                 [
@@ -1009,7 +554,7 @@ mod tests {
             .collect::<std::collections::HashMap<_, _>>();
 
         assert!(
-            matches!(result, AudienceInsightResult::Demographics(snapshot) if snapshot.demographics.len() == 2)
+            matches!(result, AudienceInsightResult::Demographics(insight) if insight.dimension == DemographicDimension::Country && insight.buckets.len() == 2)
         );
         assert_eq!(
             query.get("metric").map(|value| value.as_ref()),
@@ -1066,7 +611,7 @@ mod tests {
             "/../threads-ingest/tests/fixtures/mentions_terminal_page.json"
         ));
         let mentions: Envelope<PostDto> = serde_json::from_str(fixture).unwrap();
-        let page = envelope_to_page(mentions, None);
+        let page = posts::envelope_to_page(mentions, None).expect("fixture has no posts");
 
         assert!(page.items.is_empty());
         assert!(page.next.is_none());
@@ -1079,11 +624,7 @@ mod tests {
             "/../threads-ingest/tests/fixtures/audience_empty_data.json"
         ));
         let insights: InsightsEnvelope = serde_json::from_str(fixture).unwrap();
-        let result = insight_to_result(
-            insights,
-            &UserId::new("17841400000000000"),
-            AudienceInsightQuery::FollowersCount,
-        );
+        let result = audience::into_result(insights, AudienceInsightQuery::FollowersCount);
 
         assert!(matches!(result, Err(Error::Parse(_))));
     }

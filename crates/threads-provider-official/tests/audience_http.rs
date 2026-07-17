@@ -1,4 +1,7 @@
-use threads_core::{AudienceInsightQuery, Cursor, Error, Provider, UserId};
+use threads_core::{
+    AudienceInsightQuery, AudienceInsightResult, Cursor, DemographicDimension, DemographicInsight,
+    Error, Provider, UserId,
+};
 use threads_manifest::Manifest;
 use threads_provider_official::{OfficialProvider, client::HttpClient};
 use tokio::{
@@ -152,4 +155,79 @@ async fn official_audience_errors_map_from_local_http_without_real_network_acces
             (_, other) => panic!("unexpected result: {other:?}"),
         }
     }
+}
+
+#[tokio::test]
+async fn official_demographics_return_only_the_requested_partial_buckets() {
+    // Given: an age breakdown whose known buckets total 1030, not the authoritative 1234 followers.
+    let account = UserId::new("17841400000000000");
+    let (base, local_server) = server(Reply {
+        status: "200 OK",
+        body: include_str!("../../threads-ingest/tests/fixtures/audience_demographics_age.json"),
+    })
+    .await;
+
+    // When: the provider fetches the official demographic insight.
+    let result = provider(&base)
+        .fetch_audience_insight(
+            &account,
+            AudienceInsightQuery::FollowerDemographics(DemographicDimension::Age),
+        )
+        .await;
+    let request = local_server.await.expect("local server");
+
+    // Then: the result has just its dimension and buckets; it cannot claim a follower total.
+    assert!(matches!(
+        result,
+        Ok(AudienceInsightResult::Demographics(DemographicInsight {
+            dimension: DemographicDimension::Age,
+            buckets,
+        })) if buckets.iter().map(|bucket| bucket.value).sum::<u64>() == 1030
+    ));
+    let url = request_url(&request);
+    assert_eq!(
+        url.query_pairs()
+            .collect::<std::collections::HashMap<_, _>>()
+            .get("breakdown"),
+        Some(&"age".into())
+    );
+}
+
+#[tokio::test]
+async fn official_provider_rejects_posts_without_an_owner_or_username() {
+    // Given: a documented envelope whose post omits both supported author identities.
+    let (base, local_server) = server(Reply {
+        status: "200 OK",
+        body: r#"{"data":[{"id":"post-without-author"}]}"#,
+    })
+    .await;
+
+    // When: the provider converts the response at its public boundary.
+    let result = provider(&base)
+        .fetch_mentions(&UserId::new("account"), None, 1)
+        .await;
+    let _request = local_server.await.expect("local server");
+
+    // Then: no empty synthetic user ID can enter the core model.
+    assert!(matches!(result, Err(Error::Parse(_))));
+}
+
+#[tokio::test]
+async fn official_provider_encodes_hostile_user_ids_in_exact_versioned_paths() {
+    // Given: a local official envelope and a hostile identifier.
+    let (base, local_server) = server(Reply {
+        status: "200 OK",
+        body: include_str!("../../threads-ingest/tests/fixtures/mentions_terminal_page.json"),
+    })
+    .await;
+
+    // When: the provider requests the documented mentions edge.
+    let result = provider(&base)
+        .fetch_mentions(&UserId::new("a b+c%/✓"), None, 1)
+        .await;
+    let request = local_server.await.expect("local server");
+
+    // Then: the endpoint version remains fixed and the identifier stays one path segment.
+    assert!(result.is_ok());
+    assert!(request.starts_with("GET /v1.0/a%20b%2Bc%25%2F%E2%9C%93/mentions?"));
 }

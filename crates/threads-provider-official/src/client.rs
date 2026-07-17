@@ -2,17 +2,11 @@ use std::time::Duration;
 
 use serde::de::DeserializeOwned;
 use threads_core::{Error, Result};
-use tracing::{debug, warn};
 use url::Url;
 
-use crate::redact;
+mod retry;
+mod transport;
 
-/// Low-level HTTP client for `https://graph.threads.net`.
-///
-/// - Automatically appends `access_token` on every request.
-/// - Retries on 429 with exponential backoff + jitter (cap 30s, max 5
-///   attempts). Also backs off preemptively when `x-app-usage` reports >= 90%.
-/// - Maps HTTP status codes to [`threads_core::Error`] variants.
 #[derive(Clone)]
 pub struct HttpClient {
     inner: reqwest::Client,
@@ -22,410 +16,289 @@ pub struct HttpClient {
 
 impl HttpClient {
     pub fn new(base_url: &str, token: impl Into<String>) -> Result<Self> {
-        let base = Url::parse(base_url)?;
-        let inner = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .connect_timeout(Duration::from_secs(10))
-            .build()
-            .map_err(|e| Error::Network(format!("reqwest client: {e}")))?;
         Ok(Self {
-            inner,
-            base,
+            inner: reqwest::Client::builder()
+                .timeout(Duration::from_secs(30))
+                .connect_timeout(Duration::from_secs(10))
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .map_err(|error| Error::Network(error.without_url().to_string()))?,
+            base: Url::parse(base_url)?,
             token: token.into(),
         })
     }
 
-    /// GET `path` (absolute or relative to `base`) returning `T`.
     pub async fn get_json<T: DeserializeOwned>(
         &self,
         path: &str,
         query: &[(&str, &str)],
     ) -> Result<T> {
-        let value = self.get_json_value(path, query).await?;
-        serde_json::from_value(value).map_err(Error::from)
+        serde_json::from_value(self.get_json_value(path, query).await?).map_err(Error::from)
     }
 
-    /// GET returning the raw JSON `Value` (useful for normalizer retention).
     pub async fn get_json_value(
         &self,
         path: &str,
         query: &[(&str, &str)],
     ) -> Result<serde_json::Value> {
-        let mut url = if path.starts_with("http://") || path.starts_with("https://") {
-            Url::parse(path)?
-        } else {
-            self.base.join(path)?
-        };
-        {
-            let mut q = url.query_pairs_mut();
-            for (k, v) in query {
-                q.append_pair(k, v);
-            }
-            q.append_pair("access_token", &self.token);
-        }
-
-        let mut attempt = 0u32;
-        let mut delay_ms = 250u64;
-        loop {
-            attempt += 1;
-            let resp = self
-                .inner
-                .get(url.clone())
-                .send()
-                .await
-                .map_err(|e| Error::Network(e.to_string()))?;
-            let status = resp.status();
-            let app_usage = resp
-                .headers()
-                .get("x-app-usage")
-                .and_then(|v| v.to_str().ok())
-                .map(str::to_owned);
-            let retry_after = resp
-                .headers()
-                .get("retry-after")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.parse::<u64>().ok());
-
-            if status.is_success() {
-                let body = resp
-                    .text()
-                    .await
-                    .map_err(|e| Error::Network(e.to_string()))?;
-                if let Some(usage) = app_usage.as_deref() {
-                    if is_near_limit(usage) {
-                        warn!(usage, "threads API near rate limit; client-side backoff");
-                    }
-                }
-                return serde_json::from_str(&body).map_err(Error::from);
-            }
-
-            let body = redact::redact(&resp.text().await.unwrap_or_default());
-            match status.as_u16() {
-                401 => return Err(Error::Auth(format!("{status}: {body}"))),
-                403 => return Err(Error::PermissionDenied(format!("{status}: {body}"))),
-                404 => return Err(Error::NotFound(body)),
-                429 => {
-                    if attempt > 5 {
-                        return Err(Error::RateLimit {
-                            retry_after: retry_after.map(Duration::from_secs),
-                        });
-                    }
-                    let wait = retry_after
-                        .map(Duration::from_secs)
-                        .unwrap_or_else(|| backoff(delay_ms));
-                    debug!(?wait, attempt, "rate limited, backing off");
-                    tokio::time::sleep(wait).await;
-                    delay_ms = (delay_ms * 2).min(30_000);
-                }
-                s if (500..600).contains(&s) => {
-                    if attempt > 5 {
-                        return Err(Error::Network(format!("{status}: {body}")));
-                    }
-                    tokio::time::sleep(backoff(delay_ms)).await;
-                    delay_ms = (delay_ms * 2).min(30_000);
-                }
-                _ => return Err(Error::Other(format!("{status}: {body}"))),
-            }
-        }
+        self.execute(path, query, transport::Method::Get, false)
+            .await
     }
 
-    /// DELETE `path` (absolute or relative to `base`) returning the raw JSON `Value`.
-    ///
-    /// Equivalent curl shape:
-    /// `curl -X DELETE 'https://graph.threads.net/v1.0/{post-id}?access_token=...'`.
     pub async fn delete_json(
         &self,
         path: &str,
         query: &[(&str, &str)],
     ) -> Result<serde_json::Value> {
-        let mut url = if path.starts_with("http://") || path.starts_with("https://") {
-            Url::parse(path)?
-        } else {
-            self.base.join(path)?
-        };
-        {
-            let mut q = url.query_pairs_mut();
-            for (k, v) in query {
-                q.append_pair(k, v);
-            }
-            q.append_pair("access_token", &self.token);
-        }
-
-        let mut attempt = 0u32;
-        let mut delay_ms = 250u64;
-        loop {
-            attempt += 1;
-            let resp = self
-                .inner
-                .delete(url.clone())
-                .send()
-                .await
-                .map_err(|e| Error::Network(e.to_string()))?;
-            let status = resp.status();
-            let app_usage = resp
-                .headers()
-                .get("x-app-usage")
-                .and_then(|v| v.to_str().ok())
-                .map(str::to_owned);
-            let retry_after = resp
-                .headers()
-                .get("retry-after")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.parse::<u64>().ok());
-
-            if status.is_success() {
-                let body = resp
-                    .text()
-                    .await
-                    .map_err(|e| Error::Network(e.to_string()))?;
-                if let Some(usage) = app_usage.as_deref() {
-                    if is_near_limit(usage) {
-                        warn!(usage, "threads API near rate limit; client-side backoff");
-                    }
-                }
-                if body.trim().is_empty() {
-                    return Ok(serde_json::Value::Null);
-                }
-                return serde_json::from_str(&body).map_err(Error::from);
-            }
-
-            let body = redact::redact(&resp.text().await.unwrap_or_default());
-            match status.as_u16() {
-                401 => return Err(Error::Auth(format!("{status}: {body}"))),
-                403 => return Err(Error::PermissionDenied(format!("{status}: {body}"))),
-                404 => return Err(Error::NotFound(body)),
-                429 => {
-                    if attempt > 5 {
-                        return Err(Error::RateLimit {
-                            retry_after: retry_after.map(Duration::from_secs),
-                        });
-                    }
-                    let wait = retry_after
-                        .map(Duration::from_secs)
-                        .unwrap_or_else(|| backoff(delay_ms));
-                    debug!(?wait, attempt, "rate limited, backing off");
-                    tokio::time::sleep(wait).await;
-                    delay_ms = (delay_ms * 2).min(30_000);
-                }
-                s if (500..600).contains(&s) => {
-                    if attempt > 5 {
-                        return Err(Error::Network(format!("{status}: {body}")));
-                    }
-                    tokio::time::sleep(backoff(delay_ms)).await;
-                    delay_ms = (delay_ms * 2).min(30_000);
-                }
-                _ => return Err(Error::Other(format!("{status}: {body}"))),
-            }
-        }
+        self.execute(path, query, transport::Method::Delete, true)
+            .await
     }
 
-    /// POST `path` (absolute or relative to `base`), passing `query` params
-    /// (including `access_token`) on the query string. Returns the raw JSON `Value`.
-    ///
-    /// Mirrors `delete_json`: same 429/5xx retry policy, `x-app-usage` backoff,
-    /// redaction, and error mapping.
-    ///
-    /// Equivalent curl shape:
-    /// `curl -X POST 'https://graph.threads.net/v1.0/me/threads?media_type=TEXT&text=hi&access_token=...'`.
     pub async fn post_json(&self, path: &str, query: &[(&str, &str)]) -> Result<serde_json::Value> {
-        let mut url = if path.starts_with("http://") || path.starts_with("https://") {
+        self.execute(path, query, transport::Method::Post, true)
+            .await
+    }
+
+    async fn execute(
+        &self,
+        path: &str,
+        query: &[(&str, &str)],
+        method: transport::Method,
+        empty_is_null: bool,
+    ) -> Result<serde_json::Value> {
+        let mut url = self.resolve_url(path)?;
+        {
+            let mut pairs = url.query_pairs_mut();
+            for (key, value) in query {
+                pairs.append_pair(key, value);
+            }
+            pairs.append_pair("access_token", &self.token);
+        }
+        transport::execute(&self.inner, url, method, empty_is_null).await
+    }
+
+    fn resolve_url(&self, path: &str) -> Result<Url> {
+        let url = if path.starts_with("http://") || path.starts_with("https://") {
             Url::parse(path)?
         } else {
             self.base.join(path)?
         };
-        {
-            let mut q = url.query_pairs_mut();
-            for (k, v) in query {
-                q.append_pair(k, v);
-            }
-            q.append_pair("access_token", &self.token);
+        if url.origin() != self.base.origin() {
+            return Err(Error::Config(
+                "refusing to send an access token off-origin".into(),
+            ));
         }
-
-        let mut attempt = 0u32;
-        let mut delay_ms = 250u64;
-        loop {
-            attempt += 1;
-            let resp = self
-                .inner
-                .post(url.clone())
-                .send()
-                .await
-                .map_err(|e| Error::Network(e.to_string()))?;
-            let status = resp.status();
-            let app_usage = resp
-                .headers()
-                .get("x-app-usage")
-                .and_then(|v| v.to_str().ok())
-                .map(str::to_owned);
-            let retry_after = resp
-                .headers()
-                .get("retry-after")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.parse::<u64>().ok());
-
-            if status.is_success() {
-                let body = resp
-                    .text()
-                    .await
-                    .map_err(|e| Error::Network(e.to_string()))?;
-                if let Some(usage) = app_usage.as_deref() {
-                    if is_near_limit(usage) {
-                        warn!(usage, "threads API near rate limit; client-side backoff");
-                    }
-                }
-                if body.trim().is_empty() {
-                    return Ok(serde_json::Value::Null);
-                }
-                return serde_json::from_str(&body).map_err(Error::from);
-            }
-
-            let body = redact::redact(&resp.text().await.unwrap_or_default());
-            match status.as_u16() {
-                401 => return Err(Error::Auth(format!("{status}: {body}"))),
-                403 => return Err(Error::PermissionDenied(format!("{status}: {body}"))),
-                404 => return Err(Error::NotFound(body)),
-                429 => {
-                    if attempt > 5 {
-                        return Err(Error::RateLimit {
-                            retry_after: retry_after.map(Duration::from_secs),
-                        });
-                    }
-                    let wait = retry_after
-                        .map(Duration::from_secs)
-                        .unwrap_or_else(|| backoff(delay_ms));
-                    debug!(?wait, attempt, "rate limited, backing off");
-                    tokio::time::sleep(wait).await;
-                    delay_ms = (delay_ms * 2).min(30_000);
-                }
-                s if (500..600).contains(&s) => {
-                    if attempt > 5 {
-                        return Err(Error::Network(format!("{status}: {body}")));
-                    }
-                    tokio::time::sleep(backoff(delay_ms)).await;
-                    delay_ms = (delay_ms * 2).min(30_000);
-                }
-                _ => return Err(Error::Other(format!("{status}: {body}"))),
-            }
-        }
+        Ok(url)
     }
-}
-
-fn is_near_limit(x_app_usage: &str) -> bool {
-    let v: serde_json::Value = match serde_json::from_str(x_app_usage) {
-        Ok(v) => v,
-        Err(_) => return false,
-    };
-    let Some(obj) = v.as_object() else {
-        return false;
-    };
-    obj.values().filter_map(|n| n.as_f64()).any(|n| n >= 90.0)
-}
-
-fn backoff(base_ms: u64) -> Duration {
-    let jitter = fastrand_like_jitter(base_ms);
-    Duration::from_millis(base_ms + jitter)
-}
-
-// Cheap per-process jitter: xorshift on a process-local seed. Avoids adding
-// the `rand` crate for just this one thing.
-fn fastrand_like_jitter(base_ms: u64) -> u64 {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SEED: AtomicU64 = AtomicU64::new(0x9E3779B97F4A7C15);
-    let mut x = SEED.load(Ordering::Relaxed);
-    if x == 0 {
-        x = 0xDEADBEEFCAFEBABE;
-    }
-    x ^= x << 13;
-    x ^= x >> 7;
-    x ^= x << 17;
-    SEED.store(x, Ordering::Relaxed);
-    x % base_ms.max(1)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn post_json_url_would_append_access_token() {
-        // We cannot hit the real network in tests. This test verifies the
-        // URL-building logic by inspecting `is_near_limit` and `backoff`
-        // helpers that post_json reuses — and verifies the method compiles
-        // and is reachable.
-        // Minimal smoke-check: the type signature must accept the call.
-        // (Actual network behavior is covered by the fake-provider CLI tests.)
-        use url::Url;
-        let base = Url::parse("https://graph.threads.net").unwrap();
-        let mut url = base.join("/v1.0/me/threads").unwrap();
-        {
-            let mut q = url.query_pairs_mut();
-            q.append_pair("media_type", "TEXT");
-            q.append_pair("text", "hello");
-            q.append_pair("access_token", "tok");
-        }
-        let s = url.to_string();
-        assert!(s.contains("access_token=tok"));
-        assert!(s.contains("media_type=TEXT"));
-        assert!(s.contains("text=hello"));
-    }
+    use crate::client::retry::{backoff, is_near_limit, retry_after_delay};
 
     #[test]
     fn near_limit_detects_high_percentage() {
-        let json = r#"{"call_count":95.0,"total_time":12.3}"#;
-        assert!(is_near_limit(json));
+        assert!(is_near_limit(r#"{"call_count":95.0}"#));
     }
 
     #[test]
     fn near_limit_false_when_low() {
-        let json = r#"{"call_count":10.0,"total_time":2.0}"#;
-        assert!(!is_near_limit(json));
+        assert!(!is_near_limit(r#"{"call_count":10.0}"#));
     }
 
     #[test]
     fn backoff_is_bounded() {
-        let d = backoff(250);
-        assert!(d >= Duration::from_millis(250));
-        assert!(d < Duration::from_millis(500));
+        let delay = backoff(250);
+        assert!(delay >= Duration::from_millis(250));
+        assert!(delay < Duration::from_millis(500));
     }
 
-    async fn error_response_server(status: u16) -> (String, tokio::task::JoinHandle<()>) {
-        use tokio::{io::AsyncWriteExt as _, net::TcpListener};
+    #[test]
+    fn retry_after_is_capped_to_the_documented_maximum() {
+        assert_eq!(
+            retry_after_delay(Some("999999")),
+            Some(Duration::from_secs(30))
+        );
+    }
 
+    #[test]
+    fn rejects_off_origin_absolute_urls_before_attaching_a_token() {
+        assert!(matches!(
+            HttpClient::new("https://graph.threads.net", "secret")
+                .unwrap()
+                .resolve_url("https://example.com/redirect"),
+            Err(Error::Config(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn post_json_sends_expected_method_query_and_access_token() {
+        use tokio::{
+            io::{AsyncReadExt as _, AsyncWriteExt as _},
+            net::TcpListener,
+        };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
-            socket
-                .write_all(
-                    format!(
-                        "HTTP/1.1 {status} Error\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
-                    )
-                    .as_bytes(),
-                )
+            let mut request = vec![0; 2048];
+            let read = socket.read(&mut request).await.unwrap();
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}").await.unwrap();
+            String::from_utf8(request[..read].to_vec()).unwrap()
+        });
+        let response = HttpClient::new(&format!("http://{address}"), "token")
+            .unwrap()
+            .post_json("/v1.0/me/threads", &[("text", "hello world")])
+            .await
+            .unwrap();
+        assert_eq!(response["ok"], true);
+        assert!(
+            server
                 .await
-                .unwrap();
+                .unwrap()
+                .starts_with("POST /v1.0/me/threads?text=hello+world&access_token=token HTTP/1.1")
+        );
+    }
+
+    async fn counted_error_server(status: u16) -> (String, tokio::task::JoinHandle<usize>) {
+        use tokio::{
+            io::{AsyncReadExt as _, AsyncWriteExt as _},
+            net::TcpListener,
+            time::timeout,
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut count = 0;
+            while let Ok(Ok((mut socket, _))) =
+                timeout(Duration::from_millis(100), listener.accept()).await
+            {
+                let mut request = [0; 2048];
+                let _ = socket.read(&mut request).await.unwrap();
+                socket
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 {status} Error\r\nRetry-After: 0\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+                count += 1;
+            }
+            count
         });
         (format!("http://{address}"), server)
     }
 
     #[tokio::test]
-    async fn get_maps_401_to_auth_and_403_to_permission_denied() {
-        let (unauthorized_base, unauthorized_server) = error_response_server(401).await;
-        let unauthorized = HttpClient::new(&unauthorized_base, "token")
-            .unwrap()
-            .get_json_value("/", &[])
-            .await
-            .unwrap_err();
-        unauthorized_server.await.unwrap();
-        assert!(matches!(unauthorized, Error::Auth(_)));
+    async fn get_retries_429_within_the_retry_bound() {
+        let (base, server) = counted_error_server(429).await;
 
-        let (forbidden_base, forbidden_server) = error_response_server(403).await;
-        let forbidden = HttpClient::new(&forbidden_base, "token")
+        let error = HttpClient::new(&base, "token")
             .unwrap()
             .get_json_value("/", &[])
             .await
             .unwrap_err();
-        forbidden_server.await.unwrap();
-        assert!(matches!(forbidden, Error::PermissionDenied(_)));
+
+        assert!(matches!(error, Error::RateLimit { .. }));
+        assert_eq!(server.await.unwrap(), 6);
+    }
+
+    #[tokio::test]
+    async fn get_retries_5xx_within_the_retry_bound() {
+        let (base, server) = counted_error_server(500).await;
+
+        let error = HttpClient::new(&base, "token")
+            .unwrap()
+            .get_json_value("/", &[])
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, Error::Network(_)));
+        assert_eq!(server.await.unwrap(), 6);
+    }
+
+    #[tokio::test]
+    async fn delete_retries_429_within_the_retry_bound() {
+        let (base, server) = counted_error_server(429).await;
+
+        let error = HttpClient::new(&base, "token")
+            .unwrap()
+            .delete_json("/", &[])
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, Error::RateLimit { .. }));
+        assert_eq!(server.await.unwrap(), 6);
+    }
+
+    #[tokio::test]
+    async fn post_429_returns_rate_limit_after_one_request() {
+        let (base, server) = counted_error_server(429).await;
+
+        let error = HttpClient::new(&base, "token")
+            .unwrap()
+            .post_json("/", &[])
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, Error::RateLimit { .. }));
+        assert_eq!(server.await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn post_5xx_returns_network_error_after_one_request() {
+        let (base, server) = counted_error_server(500).await;
+
+        let error = HttpClient::new(&base, "token")
+            .unwrap()
+            .post_json("/", &[])
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, Error::Network(_)));
+        assert_eq!(server.await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn get_maps_401_to_auth_and_403_to_permission_denied() {
+        async fn error_base(status: u16) -> (String, tokio::task::JoinHandle<()>) {
+            use tokio::{io::AsyncWriteExt as _, net::TcpListener};
+
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                socket
+                    .write_all(
+                        format!("HTTP/1.1 {status} Error\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}")
+                            .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            });
+            (format!("http://{address}"), server)
+        }
+
+        let (base, server) = error_base(401).await;
+        let error = HttpClient::new(&base, "token")
+            .unwrap()
+            .get_json_value("/", &[])
+            .await
+            .unwrap_err();
+        server.await.unwrap();
+        assert!(matches!(error, Error::Auth(_)));
+
+        let (base, server) = error_base(403).await;
+        let error = HttpClient::new(&base, "token")
+            .unwrap()
+            .get_json_value("/", &[])
+            .await
+            .unwrap_err();
+        server.await.unwrap();
+        assert!(matches!(error, Error::PermissionDenied(_)));
     }
 }
