@@ -12,6 +12,9 @@ mod migrations;
 mod private_io;
 mod query;
 mod store;
+#[cfg(all(test, unix))]
+#[path = "store_file_tests.rs"]
+mod store_file_tests;
 #[cfg(test)]
 mod tests;
 
