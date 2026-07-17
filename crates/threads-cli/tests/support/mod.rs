@@ -36,9 +36,13 @@ impl Harness {
 
     pub(crate) fn write_token(&self, account_id: Option<&str>, scopes: &[&str]) {
         let path = self.token_path();
-        fs::create_dir_all(path.parent().expect("token parent")).expect("create token directory");
+        let parent = path.parent().expect("token parent");
+        fs::create_dir_all(parent).expect("create token directory");
+        #[cfg(unix)]
+        fs::set_permissions(parent, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .expect("restrict token directory");
         fs::write(
-            path,
+            &path,
             serde_json::to_vec(&json!({
                 "access_token": "test-only-token",
                 "requested_scopes": scopes,
@@ -48,6 +52,9 @@ impl Harness {
             .expect("serialize test token"),
         )
         .expect("write test token");
+        #[cfg(unix)]
+        fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+            .expect("restrict token file");
     }
 
     pub(crate) fn run(&self, arguments: &[&str]) -> Output {

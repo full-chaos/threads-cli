@@ -314,14 +314,10 @@ mod tests {
         assert!(Cli::try_parse_from(["threads-cli", "audience", "refresh"]).is_ok());
         assert!(Cli::try_parse_from(["threads-cli", "audience", "show"]).is_ok());
         assert!(Cli::try_parse_from(["threads-cli", "audience", "engaged"]).is_ok());
-        assert!(Cli::try_parse_from([
-            "threads-cli",
-            "audience",
-            "purge",
-            "--before",
-            "2026-01-01"
-        ])
-        .is_ok());
+        assert!(
+            Cli::try_parse_from(["threads-cli", "audience", "purge", "--before", "2026-01-01"])
+                .is_ok()
+        );
     }
 
     #[test]

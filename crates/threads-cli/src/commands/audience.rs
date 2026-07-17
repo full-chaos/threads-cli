@@ -54,10 +54,23 @@ async fn refresh(config_override: Option<&Path>, db_override: Option<&Path>) -> 
         summary.demographics_count,
         summary.mentions_ingested
     );
-    if let Some(warning) = summary.mention_warning {
-        eprintln!("mentions warning: {warning:?}");
+    if let Some(warning) = mention_warning_message(&summary) {
+        eprintln!("{warning}");
     }
     Ok(())
+}
+
+fn mention_warning_message(summary: &threads_ingest::AudienceRefreshSummary) -> Option<String> {
+    match &summary.mention_warning {
+        Some(threads_ingest::MentionIngestWarning::PermissionDenied(_)) => Some(
+            "mentions warning: permission denied; `threads_manage_mentions` was not granted. Run `threads-cli auth login` to request it again.".into(),
+        ),
+        Some(
+            threads_ingest::MentionIngestWarning::MissingAuthenticatedUsername
+            | threads_ingest::MentionIngestWarning::ApiFailure(_),
+        )
+        | None => None,
+    }
 }
 
 fn show(

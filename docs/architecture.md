@@ -65,7 +65,7 @@ pub trait Provider: Send + Sync {
     async fn fetch_thread(&self, root_id: &PostId) -> Result<Vec<Post>>;
     async fn fetch_audience_insight(&self, user_id: &UserId, query: AudienceInsightQuery)
         -> Result<AudienceInsightResult>;
-    async fn fetch_mentions(&self, user_id: &UserId, cursor: Option<Cursor>, limit: u32)
+    async fn fetch_mentions(&self, user_id: &UserId, cursor: Option<Cursor>, limit: usize)
         -> Result<Page<Post>>;
 }
 ```
@@ -94,7 +94,7 @@ runtime flag to participate in ingests.
 
 ```
 init      → writes ~/.config/threads-cli/config.toml
-auth login→ OAuth, store token (keyring | file fallback)
+auth login→ OAuth, atomically mirror token metadata/access token to a private file and save to Keychain best-effort
 ingest me → orchestrator {
     1. fetch_me()
     2. loop fetch_my_threads(cursor)
@@ -105,6 +105,12 @@ ingest me → orchestrator {
     7. retain raw JSON in raw_payloads table
 }
 ```
+
+Token reads are file-first. The private token-file mirror is always written on
+save and is read before Keychain; Keychain storage is best-effort rather than a
+fallback-only persistence path. On Unix, the mirror is atomically replaced and
+accepted only from an owner-controlled, non-group/world-writable directory as
+an owner-only regular file.
 
 ## Data flow (delete — destructive remote)
 
@@ -159,10 +165,12 @@ audience refresh
     → typed Post + Mention records in the local store
 ```
 
-Insights persistence is atomic. A Mentions permission/API failure warns while
-retaining a valid snapshot. The resulting trend is local snapshot history, not
-Meta historical data. The web provider is read-only and is not part of this
-flow. Audience/raw data is account-scoped and excluded from post export.
+Insights persistence is atomic. Once the snapshot is committed, only a Mentions
+permission denial is downgraded to a warning; authentication, network, parse,
+rate-limit, and store errors fail the command while retaining the committed
+snapshot. The resulting trend is local snapshot history, not Meta historical
+data. The web provider is read-only and is not part of this flow. Audience/raw
+data is account-scoped and excluded from post export.
 
 ## Manifest action types
 

@@ -5,7 +5,7 @@ use serde::Serialize;
 use threads_core::EngagedAccount;
 
 use super::{AudienceOutputRow, AudienceReport, EngagedOutputRow, dimension_key};
-use crate::output::OutputFormat;
+use crate::output::{OutputFormat, sanitize_terminal_text};
 
 pub fn render_audience_report(
     report: &AudienceReport,
@@ -53,7 +53,7 @@ fn render_audience_human(report: &AudienceReport, writer: &mut dyn Write) -> Res
     writeln!(
         writer,
         "account: {}",
-        report.account_id.as_deref().unwrap_or_default()
+        sanitize_terminal_text(report.account_id.as_deref().unwrap_or_default())
     )?;
     for (index, snapshot) in report.snapshots.iter().enumerate() {
         let group = if index + 1 == report.snapshots.len() {
@@ -73,7 +73,7 @@ fn render_audience_human(report: &AudienceReport, writer: &mut dyn Write) -> Res
                 writer,
                 "  demographics: {} {}={}",
                 dimension_key(demographic.dimension),
-                demographic.bucket,
+                sanitize_terminal_text(&demographic.bucket),
                 demographic.value
             )?;
         }
@@ -92,8 +92,8 @@ fn render_engaged_human(rows: &[EngagedOutputRow], writer: &mut dyn Write) -> Re
             writer,
             "{} {} {} {} {} {}",
             row.rank,
-            terminal_cell(&row.user_id),
-            terminal_cell(row.username.as_deref().unwrap_or("")),
+            sanitize_terminal_text(&row.user_id),
+            sanitize_terminal_text(row.username.as_deref().unwrap_or("")),
             row.replies,
             row.mentions,
             row.total
@@ -194,17 +194,4 @@ fn format_delta(delta: Option<i64>) -> String {
 
 fn format_csv_delta(delta: Option<i64>) -> String {
     delta.map_or_else(String::new, |value| value.to_string())
-}
-
-fn terminal_cell(value: &str) -> String {
-    value
-        .chars()
-        .map(|character| {
-            if character.is_control() {
-                ' '
-            } else {
-                character
-            }
-        })
-        .collect()
 }

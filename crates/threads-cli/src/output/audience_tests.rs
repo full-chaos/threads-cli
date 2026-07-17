@@ -229,6 +229,81 @@ fn human_engagement_sanitizes_terminal_control_characters() {
 }
 
 #[test]
+fn human_audience_sanitizes_every_external_terminal_cell() {
+    // Given: provider-originated account and bucket values with terminal controls.
+    let snapshots = [AudienceSnapshot {
+        account_id: UserId::new("account\nwith\rcontrols\tand\u{1b}escape"),
+        observed_at: Utc.with_ymd_and_hms(2026, 7, 16, 9, 0, 0).unwrap(),
+        followers_count: 100,
+        demographics: vec![DemographicBucket {
+            dimension: DemographicDimension::Country,
+            bucket: "bucket\nwith\rcontrols\tand\u{1b}escape".into(),
+            value: 42,
+        }],
+    }];
+    let report = AudienceReport::from_snapshots(&snapshots).unwrap();
+    let mut buffer = Vec::new();
+
+    // When: the human audience renderer writes its terminal rows.
+    render_audience_report(&report, OutputFormat::Human, &mut buffer).unwrap();
+    let output = String::from_utf8(buffer).unwrap();
+
+    // Then: controls cannot create terminal rows or escape sequences in any data cell.
+    assert_eq!(output.lines().count(), 3);
+    assert!(
+        output
+            .lines()
+            .all(|line| !line.contains(['\r', '\t', '\u{1b}']))
+    );
+    assert!(output.contains("account with controls and escape"));
+    assert!(output.contains("bucket with controls and escape"));
+}
+
+#[test]
+fn machine_audience_formats_preserve_control_characters_as_encoded_data() {
+    // Given: provider-originated account and bucket values with a terminal escape character.
+    let snapshots = [AudienceSnapshot {
+        account_id: UserId::new("account\u{1b}escape"),
+        observed_at: Utc.with_ymd_and_hms(2026, 7, 16, 9, 0, 0).unwrap(),
+        followers_count: 100,
+        demographics: vec![DemographicBucket {
+            dimension: DemographicDimension::Country,
+            bucket: "bucket\u{1b}escape".into(),
+            value: 42,
+        }],
+    }];
+    let report = AudienceReport::from_snapshots(&snapshots).unwrap();
+
+    // When: JSON, JSONL, and CSV machine formats are rendered.
+    let mut json = Vec::new();
+    let mut jsonl = Vec::new();
+    let mut csv = Vec::new();
+    render_audience_report(&report, OutputFormat::Json, &mut json).unwrap();
+    render_audience_report(&report, OutputFormat::Jsonl, &mut jsonl).unwrap();
+    render_audience_report(&report, OutputFormat::Csv, &mut csv).unwrap();
+
+    // Then: source data remains intact through each encoded machine format.
+    let json: serde_json::Value = serde_json::from_slice(&json).unwrap();
+    assert_eq!(json["account_id"], serde_json::json!("account\u{1b}escape"));
+    let jsonl: Vec<serde_json::Value> = String::from_utf8(jsonl)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(
+        jsonl[0]["account_id"],
+        serde_json::json!("account\u{1b}escape")
+    );
+    assert_eq!(jsonl[1]["bucket"], serde_json::json!("bucket\u{1b}escape"));
+    let records: Vec<csv::StringRecord> = csv::Reader::from_reader(csv.as_slice())
+        .records()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(records[1].get(1), Some("account\u{1b}escape"));
+    assert_eq!(records[1].get(6), Some("bucket\u{1b}escape"));
+}
+
+#[test]
 fn empty_audience_and_engagement_are_successful_and_clear() {
     // Given: no persisted snapshots or observed engagement.
     let report = AudienceReport::from_snapshots(&[]).unwrap();

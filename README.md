@@ -39,6 +39,14 @@ cargo build --workspace
 cargo test  --workspace
 ```
 
+## Token persistence
+
+`auth login` always atomically mirrors the access token and its metadata to a
+private token file, then saves the same value to Keychain on a best-effort
+basis. Reads are file-first; Keychain is consulted only when the private file
+is absent. On Unix, the file is accepted only when it is an owner-only regular
+file in an owner-controlled directory that is not group- or world-writable.
+
 ## Commands
 
 Local ingest/query and user-mediated intent commands:
@@ -75,6 +83,13 @@ The broad login requests exactly these six scopes:
 `threads_manage_mentions`. Requested scopes are not proof that Meta granted
 them; App Review and the user grant control access. The Mentions live gate is
 EXTERNALLY UNVERIFIED.
+
+After the Insights snapshot is committed, only a Mentions permission denial is
+downgraded to a warning. That warning names the required
+`threads_manage_mentions` scope and recommends `threads-cli auth login` to
+request it again. Other Mentions-phase errors (authentication, network, parse,
+rate-limit, or store failures) fail `audience refresh`; the already committed
+Insights snapshot remains available locally.
 
 Destructive remote ops (dry-run by default; `--apply` actually performs the
 delete via Meta's `DELETE /v1.0/{id}` endpoint):

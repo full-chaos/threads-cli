@@ -61,7 +61,9 @@ fn audience_refresh_preflight_requires_both_recorded_scopes() {
 fn failed_refresh_does_not_backfill_legacy_token_metadata() {
     let temporary = TempDir::new().expect("temporary token directory");
     let path = temporary.path().join("token.json");
-    let token_store = TokenStore::new().with_fallback_path(path.clone());
+    let token_store = TokenStore::new()
+        .with_fallback_path(path.clone())
+        .file_only_for_tests();
     let token = Token::new("token", None, Some(vec!["threads_manage_insights".into()]));
 
     let result = finish_refresh(
@@ -78,7 +80,9 @@ fn failed_refresh_does_not_backfill_legacy_token_metadata() {
 fn successful_refresh_backfills_a_legacy_token_account_id() {
     let temporary = TempDir::new().expect("temporary token directory");
     let path = temporary.path().join("token.json");
-    let token_store = TokenStore::new().with_fallback_path(path.clone());
+    let token_store = TokenStore::new()
+        .with_fallback_path(path.clone())
+        .file_only_for_tests();
     let token = Token::new("token", None, Some(vec!["threads_manage_insights".into()]));
     let summary = AudienceRefreshSummary {
         account_id: UserId::new("account-a"),
@@ -93,6 +97,37 @@ fn successful_refresh_backfills_a_legacy_token_account_id() {
     let saved: Token = serde_json::from_slice(&std::fs::read(path).expect("saved fallback token"))
         .expect("valid saved token");
     assert_eq!(saved.user_id.as_deref(), Some("account-a"));
+}
+
+#[test]
+fn mentions_permission_warning_names_scope_and_recommends_auth_login() {
+    let summary = AudienceRefreshSummary {
+        account_id: UserId::new("account-a"),
+        followers_count: 10,
+        demographics_count: 0,
+        mentions_ingested: 0,
+        mention_warning: Some(threads_ingest::MentionIngestWarning::PermissionDenied(
+            "threads_manage_mentions".into(),
+        )),
+    };
+
+    let warning = mention_warning_message(&summary).expect("permission warning message");
+
+    assert!(warning.contains("threads_manage_mentions"));
+    assert!(warning.contains("threads-cli auth login"));
+}
+
+#[test]
+fn mentions_non_permission_warnings_are_not_emitted() {
+    let summary = AudienceRefreshSummary {
+        account_id: UserId::new("account-a"),
+        followers_count: 10,
+        demographics_count: 0,
+        mentions_ingested: 0,
+        mention_warning: Some(threads_ingest::MentionIngestWarning::MissingAuthenticatedUsername),
+    };
+
+    assert!(mention_warning_message(&summary).is_none());
 }
 
 #[test]

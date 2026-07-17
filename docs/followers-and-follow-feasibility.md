@@ -37,8 +37,11 @@ This is not a private endpoint, session-cookie flow, or API follow mutation.
 The CLI stores each successful refresh as an account-scoped local snapshot.
 History and deltas are therefore **local observations over time**, not a
 historical series supplied by Meta. A count decrease is valid. Refresh stores
-the count and eligible demographic rows atomically; a later Mentions failure
-warns without discarding that snapshot.
+the count and eligible demographic rows atomically. After that commit, only a
+Mentions permission denial becomes a warning; authentication, network, parse,
+rate-limit, and store failures fail the command without discarding the
+snapshot. The permission warning names `threads_manage_mentions` and advises
+running `threads-cli auth login` to request it again.
 
 Mentions use `GET /{threads-user-id}/mentions`, with cursor pagination and a
 limit of 100. The endpoint returns public media that tags the authenticated

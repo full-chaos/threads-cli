@@ -36,3 +36,4 @@ url.workspace = true
 [dev-dependencies]
 async-trait.workspace = true
 tempfile.workspace = true
+threads-provider-official = { workspace = true, features = ["test-support"] }
