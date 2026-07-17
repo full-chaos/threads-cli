@@ -3,7 +3,7 @@ use std::sync::Mutex;
 
 use crate::error::{Result, StoreError};
 use crate::migrations::run_migrations;
-use crate::private_io::prepare_database_path;
+use crate::private_io::{normalize_database_path, prepare_database_path};
 use crate::query;
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OpenFlags};
@@ -25,9 +25,10 @@ unsafe impl Sync for Store {}
 impl Store {
     /// Open (or create) a store at `path`.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
-        prepare_database_path(path.as_ref())?;
+        let path = normalize_database_path(path.as_ref())?;
+        prepare_database_path(&path)?;
         let conn = Connection::open_with_flags(
-            path,
+            &path,
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
         )
         .map_err(StoreError::Sqlite)?;
