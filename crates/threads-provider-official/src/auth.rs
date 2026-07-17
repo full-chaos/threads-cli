@@ -19,12 +19,14 @@ const AUTHORIZE_BASE: &str = "https://threads.net/oauth/authorize";
 const TOKEN_EXCHANGE_BASE: &str = "https://graph.threads.net/oauth/access_token";
 const ACCESS_TOKEN_BASE: &str = "https://graph.threads.net/access_token";
 
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Clone, Debug)]
 pub struct OAuthEndpoints {
     token_exchange: Url,
     long_lived_upgrade: Url,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl OAuthEndpoints {
     pub fn new(token_exchange: String, long_lived_upgrade: String) -> Result<Self> {
         Ok(Self {
@@ -32,22 +34,19 @@ impl OAuthEndpoints {
             long_lived_upgrade: Url::parse(&long_lived_upgrade)?,
         })
     }
-
-    pub fn production() -> Result<Self> {
-        Self::new(TOKEN_EXCHANGE_BASE.into(), ACCESS_TOKEN_BASE.into())
-    }
 }
 
 pub async fn exchange_code(config: &Config, code: &str) -> Result<TokenResponse> {
-    let endpoints = OAuthEndpoints::production()?;
-    transport::exchange_code_at(config, code, &endpoints.token_exchange).await
+    let endpoint = Url::parse(TOKEN_EXCHANGE_BASE)?;
+    transport::exchange_code_at(config, code, &endpoint).await
 }
 
 pub async fn upgrade_to_long_lived(config: &Config, short_token: &str) -> Result<TokenResponse> {
-    let endpoints = OAuthEndpoints::production()?;
-    transport::upgrade_to_long_lived_at(config, short_token, &endpoints.long_lived_upgrade).await
+    let endpoint = Url::parse(ACCESS_TOKEN_BASE)?;
+    transport::upgrade_to_long_lived_at(config, short_token, &endpoint).await
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub async fn exchange_code_with_endpoints(
     config: &Config,
     code: &str,
@@ -56,6 +55,7 @@ pub async fn exchange_code_with_endpoints(
     transport::exchange_code_at(config, code, &endpoints.token_exchange).await
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub async fn upgrade_to_long_lived_with_endpoints(
     config: &Config,
     short_token: &str,
