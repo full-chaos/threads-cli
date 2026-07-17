@@ -43,19 +43,19 @@ rate-limit, and store failures fail the command without discarding the
 snapshot. The permission warning names `threads_manage_mentions` and advises
 running `threads-cli auth login` to request it again.
 
-Mentions use `GET /{threads-user-id}/mentions`, with cursor pagination and a
-limit of 100. The endpoint returns public media that tags the authenticated
-profile. Private media is excluded. Without advanced access for
-`threads_manage_mentions`, the documented behavior is tester-only results;
-after approval, public posts from other users may be returned.
+Mentions use `GET /{threads-user-id}/mentions` with cursor pagination and the
+manifest's fields projection. The refresh implementation selects 100 items per
+page; that is a client choice, not an asserted Meta maximum. The endpoint
+returns public media that tags the authenticated profile. Private media is
+excluded. Before Advanced Access, the documented behavior is tester-only
+results; after approval, public posts from other users may be returned.
 
-The official permissions material is currently inconsistent: the Mentions and
-Insights endpoint pages require `threads_manage_mentions` and
-`threads_manage_insights`, while the access-token scope table does not list
-those two names in its displayed values. The CLI requests the broad six-scope
-login and records requested scopes; it does not treat requested scopes as
-granted scopes. A real authorization/API check for Mentions is **EXTERNALLY
-UNVERIFIED** in this worktree.
+Current published documentation lists `threads_basic` and
+`threads_manage_mentions` for Mentions, and `threads_manage_insights` for
+Insights. The CLI requests the broad six-scope login and records requested
+scopes; it does not treat requested scopes as granted scopes. A real
+authorization/API check for Mentions is **EXTERNALLY UNVERIFIED** in this
+worktree.
 
 The six requested scopes are:
 

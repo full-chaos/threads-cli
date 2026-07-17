@@ -76,7 +76,9 @@ method. Audience insights are aggregate; Mentions are paginated public-media
 records.
 
 Pagination is cursor-based; providers translate their native paging (Meta's
-`paging.cursors.after`, etc.) into our opaque `Cursor(String)`.
+`paging.cursors.after`, etc.) into our opaque `Cursor(String)`. For Mentions,
+the ingest client selects a page size and the official provider forwards that
+value as `limit`; it is not manifest metadata or an asserted API maximum.
 
 ## Provider priority
 
@@ -86,9 +88,9 @@ Pagination is cursor-based; providers translate their native paging (Meta's
 3. web      (threads.net/api/graphql) — EXPERIMENTAL, feature-gated off
 ```
 
-The private web provider is **never** auto-enabled. It ships behind the
-`enabled` Cargo feature in `threads-provider-web` and requires an explicit
-runtime flag to participate in ingests.
+The private web provider is **never** auto-enabled. It is available only when
+`threads-provider-web` is built with its `enabled` Cargo feature; it is not
+wired into the CLI as a runtime-selectable ingest provider.
 
 ## Data flow (ingest)
 

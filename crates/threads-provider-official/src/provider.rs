@@ -88,9 +88,9 @@ impl Provider for OfficialProvider {
         &self,
         user_id: &UserId,
         cursor: Option<Cursor>,
-        _limit: usize,
+        limit: usize,
     ) -> Result<Page<Post>> {
-        reads::fetch_mentions(self, user_id, cursor).await
+        reads::fetch_mentions(self, user_id, cursor, limit).await
     }
 
     async fn fetch_replies(&self, post_id: &PostId, cursor: Option<Cursor>) -> Result<Page<Post>> {
@@ -569,7 +569,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetches_mentions_with_a_fixed_limit_and_cursor() {
+    async fn fetches_mentions_with_the_client_selected_page_size_and_cursor() {
         let reply = ServerReply {
             status: "200 OK",
             body: include_str!(concat!(
@@ -595,7 +595,7 @@ mod tests {
             .collect::<std::collections::HashMap<_, _>>();
 
         assert_eq!(request_url.path(), "/v1.0/17841400000000000/mentions");
-        assert_eq!(query.get("limit").map(|value| value.as_ref()), Some("100"));
+        assert_eq!(query.get("limit").map(|value| value.as_ref()), Some("12"));
         assert_eq!(
             query.get("after").map(|value| value.as_ref()),
             Some("after-cursor")

@@ -111,7 +111,7 @@ async fn official_audience_requests_use_only_documented_paths_queries_and_local_
     let query = mentions_url
         .query_pairs()
         .collect::<std::collections::HashMap<_, _>>();
-    assert_eq!(query.get("limit").map(|value| value.as_ref()), Some("100"));
+    assert_eq!(query.get("limit").map(|value| value.as_ref()), Some("1"));
     assert_eq!(
         query.get("after").map(|value| value.as_ref()),
         Some("cursor-1")

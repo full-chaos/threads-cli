@@ -84,6 +84,10 @@ The broad login requests exactly these six scopes:
 them; App Review and the user grant control access. The Mentions live gate is
 EXTERNALLY UNVERIFIED.
 
+Mentions uses Meta's cursor pagination. `audience refresh` selects 100 items
+per page as this client's implementation choice; it is not an asserted Meta
+maximum.
+
 After the Insights snapshot is committed, only a Mentions permission denial is
 downgraded to a warning. That warning names the required
 `threads_manage_mentions` scope and recommends `threads-cli auth login` to

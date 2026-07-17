@@ -40,13 +40,15 @@ pub(super) async fn fetch_mentions(
     provider: &OfficialProvider,
     user_id: &UserId,
     cursor: Option<Cursor>,
+    limit: usize,
 ) -> Result<Page<Post>> {
     let path = provider
         .edge_path("user/mentions")
         .ok_or_else(|| Error::Manifest("missing edge `user/mentions`".into()))?;
     let path = OfficialProvider::substitute_user_id(&path, user_id);
     let fields = provider.endpoint_fields("user/mentions");
-    let mut params = vec![("limit", "100")];
+    let limit = limit.to_string();
+    let mut params = vec![("limit", limit.as_str())];
     if let Some(ref fields) = fields {
         params.push(("fields", fields));
     }
