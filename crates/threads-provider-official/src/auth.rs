@@ -13,9 +13,56 @@ mod transport;
 
 #[cfg(test)]
 use transport::safe_network_error;
-pub use transport::{TokenResponse, exchange_code, refresh_long_lived, upgrade_to_long_lived};
+pub use transport::{TokenResponse, refresh_long_lived};
 
 const AUTHORIZE_BASE: &str = "https://threads.net/oauth/authorize";
+const TOKEN_EXCHANGE_BASE: &str = "https://graph.threads.net/oauth/access_token";
+const ACCESS_TOKEN_BASE: &str = "https://graph.threads.net/access_token";
+
+#[derive(Clone, Debug)]
+pub struct OAuthEndpoints {
+    token_exchange: Url,
+    long_lived_upgrade: Url,
+}
+
+impl OAuthEndpoints {
+    pub fn new(token_exchange: String, long_lived_upgrade: String) -> Result<Self> {
+        Ok(Self {
+            token_exchange: Url::parse(&token_exchange)?,
+            long_lived_upgrade: Url::parse(&long_lived_upgrade)?,
+        })
+    }
+
+    pub fn production() -> Result<Self> {
+        Self::new(TOKEN_EXCHANGE_BASE.into(), ACCESS_TOKEN_BASE.into())
+    }
+}
+
+pub async fn exchange_code(config: &Config, code: &str) -> Result<TokenResponse> {
+    let endpoints = OAuthEndpoints::production()?;
+    transport::exchange_code_at(config, code, &endpoints.token_exchange).await
+}
+
+pub async fn upgrade_to_long_lived(config: &Config, short_token: &str) -> Result<TokenResponse> {
+    let endpoints = OAuthEndpoints::production()?;
+    transport::upgrade_to_long_lived_at(config, short_token, &endpoints.long_lived_upgrade).await
+}
+
+pub async fn exchange_code_with_endpoints(
+    config: &Config,
+    code: &str,
+    endpoints: &OAuthEndpoints,
+) -> Result<TokenResponse> {
+    transport::exchange_code_at(config, code, &endpoints.token_exchange).await
+}
+
+pub async fn upgrade_to_long_lived_with_endpoints(
+    config: &Config,
+    short_token: &str,
+    endpoints: &OAuthEndpoints,
+) -> Result<TokenResponse> {
+    transport::upgrade_to_long_lived_at(config, short_token, &endpoints.long_lived_upgrade).await
+}
 
 /// Default OAuth scopes covering v1 MVP behavior.
 pub const DEFAULT_SCOPES: &[&str] = &[

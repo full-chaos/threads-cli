@@ -4,8 +4,6 @@ use url::Url;
 
 use crate::config::Config;
 
-const TOKEN_EXCHANGE_BASE: &str = "https://graph.threads.net/oauth/access_token";
-const ACCESS_TOKEN_BASE: &str = "https://graph.threads.net/access_token";
 const REFRESH_BASE: &str = "https://graph.threads.net/refresh_access_token";
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
@@ -41,7 +39,11 @@ where
     )
 }
 
-pub async fn exchange_code(config: &Config, code: &str) -> Result<TokenResponse> {
+pub(crate) async fn exchange_code_at(
+    config: &Config,
+    code: &str,
+    endpoint: &Url,
+) -> Result<TokenResponse> {
     let form = [
         ("client_id", config.app_id.as_str()),
         ("client_secret", config.app_secret.as_str()),
@@ -50,7 +52,7 @@ pub async fn exchange_code(config: &Config, code: &str) -> Result<TokenResponse>
         ("code", code),
     ];
     let response = oauth_client()?
-        .post(TOKEN_EXCHANGE_BASE)
+        .post(endpoint.clone())
         .form(&form)
         .send()
         .await
@@ -58,8 +60,12 @@ pub async fn exchange_code(config: &Config, code: &str) -> Result<TokenResponse>
     parse_token_response(response).await
 }
 
-pub async fn upgrade_to_long_lived(config: &Config, short_token: &str) -> Result<TokenResponse> {
-    let mut url = Url::parse(ACCESS_TOKEN_BASE)?;
+pub(crate) async fn upgrade_to_long_lived_at(
+    config: &Config,
+    short_token: &str,
+    endpoint: &Url,
+) -> Result<TokenResponse> {
+    let mut url = endpoint.clone();
     url.query_pairs_mut()
         .append_pair("grant_type", "th_exchange_token")
         .append_pair("client_secret", &config.app_secret)

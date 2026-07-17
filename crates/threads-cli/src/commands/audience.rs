@@ -45,7 +45,7 @@ async fn refresh(config_override: Option<&Path>, db_override: Option<&Path>) -> 
         Ingestor::new(Arc::new(provider), Box::new(OfficialNormalizer), store)
             .refresh_audience_for_account(expected_account.as_ref())
             .await
-            .map_err(|error| anyhow!("refresh audience: {error}")),
+            .map_err(audience_refresh_error),
     )?;
     println!(
         "audience refreshed: account_id={} audience_count={} demographics={} mentions_ingested={}",
@@ -70,6 +70,15 @@ fn mention_warning_message(summary: &threads_ingest::AudienceRefreshSummary) -> 
             | threads_ingest::MentionIngestWarning::ApiFailure(_),
         )
         | None => None,
+    }
+}
+
+fn audience_refresh_error(error: threads_core::Error) -> anyhow::Error {
+    match error {
+        threads_core::Error::PermissionDenied(_) => anyhow!(
+            "audience insights permission denied; `threads_manage_insights` was not granted. Run `threads-cli auth login` to request it again."
+        ),
+        other => anyhow!("refresh audience: {other}"),
     }
 }
 

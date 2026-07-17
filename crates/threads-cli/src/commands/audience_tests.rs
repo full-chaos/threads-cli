@@ -118,6 +118,15 @@ fn mentions_permission_warning_names_scope_and_recommends_auth_login() {
 }
 
 #[test]
+fn insights_permission_error_names_insights_scope_and_recommends_auth_login() {
+    let error = audience_refresh_error(threads_core::Error::PermissionDenied("403".into()));
+
+    assert!(error.to_string().contains("threads_manage_insights"));
+    assert!(error.to_string().contains("threads-cli auth login"));
+    assert!(!error.to_string().contains("threads_manage_mentions"));
+}
+
+#[test]
 fn mentions_non_permission_warnings_are_not_emitted() {
     let summary = AudienceRefreshSummary {
         account_id: UserId::new("account-a"),

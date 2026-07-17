@@ -7,11 +7,14 @@ use anyhow::{Result, anyhow};
 use rand::{TryRng, rngs::SysRng};
 use threads_provider_official::{
     auth::{self, CallbackServer, DEFAULT_SCOPES},
-    token_store::{Token, TokenStore},
+    token_store::TokenStore,
 };
 use tracing::info;
 
 use crate::{cli::AuthCommand, config::CliConfig};
+
+#[path = "auth_completion.rs"]
+mod completion;
 
 const REQUESTED_SCOPE_PURPOSES: &[(&str, &str)] = &[
     ("threads_basic", "read your Threads account basics"),
@@ -106,7 +109,7 @@ async fn login_local_listener(
         .await
         .map_err(|e| anyhow!("oauth callback: {e}"))?;
 
-    finish_login(provider_cfg, &code).await
+    completion::finish_login(provider_cfg, &code).await
 }
 
 async fn login_manual_paste(
@@ -136,34 +139,7 @@ async fn login_manual_paste(
     let mut input = String::new();
     io::stdin().read_line(&mut input)?;
     let code = parse_code_from_input(input.trim(), state)?;
-    finish_login(provider_cfg, &code).await
-}
-
-async fn finish_login(provider_cfg: &threads_provider_official::Config, code: &str) -> Result<()> {
-    let short = auth::exchange_code(provider_cfg, code)
-        .await
-        .map_err(|e| anyhow!("exchange code: {e}"))?;
-    let long = auth::upgrade_to_long_lived(provider_cfg, &short.access_token)
-        .await
-        .map_err(|e| anyhow!("upgrade to long-lived: {e}"))?;
-
-    let token = Token::new(
-        long.access_token,
-        long.expires_in,
-        Some(
-            DEFAULT_SCOPES
-                .iter()
-                .map(|scope| (*scope).to_string())
-                .collect(),
-        ),
-    )
-    .with_user_id(long.user_id.or(short.user_id));
-    TokenStore::new()
-        .save(&token)
-        .map_err(|e| anyhow!("save token: {e}"))?;
-
-    println!("Authentication complete; token stored with requested scope metadata.");
-    Ok(())
+    completion::finish_login(provider_cfg, &code).await
 }
 
 fn parse_code_from_input(input: &str, expected_state: &str) -> Result<String> {
@@ -248,66 +224,5 @@ fn print_requested_scope_consent() {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parses_full_redirect_url() {
-        let code = parse_code_from_input(
-            "https://example.com/cb?code=AQx123&state=abc&extra=1",
-            "abc",
-        )
-        .unwrap();
-        assert_eq!(code, "AQx123");
-    }
-
-    #[test]
-    fn rejects_bare_code() {
-        assert!(parse_code_from_input("AQx123", "state").is_err());
-    }
-
-    #[test]
-    fn rejects_empty_input() {
-        assert!(parse_code_from_input("", "state").is_err());
-    }
-
-    #[test]
-    fn rejects_url_without_code() {
-        assert!(parse_code_from_input("https://example.com/cb?foo=bar", "state").is_err());
-    }
-
-    #[test]
-    fn rejects_redirect_without_state() {
-        assert!(parse_code_from_input("https://example.com/cb?code=AQx123", "state").is_err());
-    }
-
-    #[test]
-    fn rejects_redirect_with_a_mismatched_state() {
-        assert!(
-            parse_code_from_input("https://example.com/cb?code=AQx123&state=wrong", "state")
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn consent_text_names_every_requested_scope_and_audience_purpose() {
-        let consent = requested_scope_consent_text();
-
-        for scope in DEFAULT_SCOPES {
-            assert!(consent.contains(scope), "missing {scope} from consent text");
-        }
-        assert!(consent.contains("audience insights"));
-        assert!(consent.contains("mentions"));
-        assert!(consent.contains("requested scopes"));
-    }
-
-    #[test]
-    fn oauth_state_uses_full_entropy_and_is_not_reused() {
-        let first = random_state().unwrap();
-        let second = random_state().unwrap();
-
-        assert_eq!(first.len(), 64);
-        assert!(first.chars().all(|character| character.is_ascii_hexdigit()));
-        assert_ne!(first, second);
-    }
-}
+#[path = "auth_tests.rs"]
+mod tests;
