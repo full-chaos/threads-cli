@@ -10,6 +10,7 @@ description = "SQLite store (schema, migrations, FTS5, queries) for threads-cli"
 threads-core.workspace = true
 
 chrono.workspace = true
+libc = "0.2"
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true

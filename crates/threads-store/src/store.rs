@@ -1,13 +1,15 @@
 use std::path::Path;
 use std::sync::Mutex;
 
-use chrono::{DateTime, Utc};
-use rusqlite::{Connection, OpenFlags};
-use threads_core::model::{FetchRun, Post, PostId, User, UserId};
-
 use crate::error::{Result, StoreError};
 use crate::migrations::run_migrations;
+use crate::private_io::prepare_database_path;
 use crate::query;
+use chrono::{DateTime, Utc};
+use rusqlite::{Connection, OpenFlags};
+use threads_core::model::{
+    AudienceSnapshot, EngagedAccount, EngagementSort, FetchRun, Post, PostId, User, UserId,
+};
 
 /// Thread-safe SQLite store.  The connection is wrapped in a `Mutex` so that
 /// `Store` can be `Send + Sync` while rusqlite's `Connection` is `!Send`.
@@ -21,19 +23,9 @@ unsafe impl Send for Store {}
 unsafe impl Sync for Store {}
 
 impl Store {
-    fn configure(conn: &Connection) -> Result<()> {
-        conn.execute_batch(
-            "PRAGMA foreign_keys = ON;
-             PRAGMA journal_mode = WAL;
-             PRAGMA busy_timeout = 5000;",
-        )
-        .map_err(StoreError::Sqlite)?;
-        run_migrations(conn)?;
-        Ok(())
-    }
-
     /// Open (or create) a store at `path`.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
+        prepare_database_path(path.as_ref())?;
         let conn = Connection::open_with_flags(
             path,
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
@@ -43,6 +35,17 @@ impl Store {
         Ok(Self {
             conn: Mutex::new(conn),
         })
+    }
+
+    fn configure(conn: &Connection) -> Result<()> {
+        conn.execute_batch(
+            "PRAGMA foreign_keys = ON;
+             PRAGMA journal_mode = WAL;
+             PRAGMA busy_timeout = 5000;",
+        )
+        .map_err(StoreError::Sqlite)?;
+        run_migrations(conn)?;
+        Ok(())
     }
 
     /// Open an in-memory store (useful for testing).
@@ -81,6 +84,42 @@ impl Store {
         query::upsert_posts(&mut conn, posts, fetch_run_id)
     }
 
+    pub fn upsert_audience_snapshot(
+        &self,
+        snapshot: &AudienceSnapshot,
+        fetch_run_id: Option<&str>,
+    ) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        query::upsert_audience_snapshot(&mut conn, snapshot, fetch_run_id)
+    }
+
+    pub fn audience_history(
+        &self,
+        account_id: &UserId,
+        limit: usize,
+    ) -> Result<Vec<AudienceSnapshot>> {
+        let conn = self.conn.lock().unwrap();
+        query::audience_history(&conn, account_id, limit)
+    }
+
+    pub fn count_audience_snapshots_before(
+        &self,
+        account_id: &UserId,
+        cutoff: DateTime<Utc>,
+    ) -> Result<u64> {
+        let conn = self.conn.lock().unwrap();
+        query::count_audience_snapshots_before(&conn, account_id, cutoff)
+    }
+
+    pub fn delete_audience_snapshots_before(
+        &self,
+        account_id: &UserId,
+        cutoff: DateTime<Utc>,
+    ) -> Result<u64> {
+        let mut conn = self.conn.lock().unwrap();
+        query::delete_audience_snapshots_before(&mut conn, account_id, cutoff)
+    }
+
     pub fn get_post(&self, id: &PostId) -> Result<Option<Post>> {
         let conn = self.conn.lock().unwrap();
         query::get_post(&conn, id)
@@ -89,6 +128,16 @@ impl Store {
     pub fn posts_by_author(&self, author: &threads_core::UserId) -> Result<Vec<PostId>> {
         let conn = self.conn.lock().unwrap();
         query::posts_by_author(&conn, author)
+    }
+
+    pub fn rank_engaged_accounts(
+        &self,
+        account_id: &UserId,
+        limit: usize,
+        sort: EngagementSort,
+    ) -> Result<Vec<EngagedAccount>> {
+        let conn = self.conn.lock().unwrap();
+        query::rank_engaged_accounts(&conn, account_id, limit, sort)
     }
 
     pub fn search_text(&self, query_str: &str, limit: usize) -> Result<Vec<Post>> {

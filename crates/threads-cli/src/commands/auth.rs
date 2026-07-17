@@ -1,17 +1,35 @@
 use std::{
-    fs,
     io::{self, Write as _},
     path::Path,
 };
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow};
+use rand::{TryRng, rngs::SysRng};
 use threads_provider_official::{
     auth::{self, CallbackServer, DEFAULT_SCOPES},
-    token_store::{Token, TokenStore},
+    token_store::TokenStore,
 };
 use tracing::info;
 
 use crate::{cli::AuthCommand, config::CliConfig};
+
+#[path = "auth_completion.rs"]
+mod completion;
+
+const REQUESTED_SCOPE_PURPOSES: &[(&str, &str)] = &[
+    ("threads_basic", "read your Threads account basics"),
+    ("threads_read_replies", "read replies to your Threads posts"),
+    ("threads_delete", "delete your Threads posts and replies"),
+    ("threads_content_publish", "publish Threads posts"),
+    (
+        "threads_manage_insights",
+        "read aggregate audience insights",
+    ),
+    (
+        "threads_manage_mentions",
+        "read posts that mention your account",
+    ),
+];
 
 pub async fn run(cmd: AuthCommand, config_override: Option<&Path>) -> Result<()> {
     match cmd {
@@ -35,7 +53,7 @@ async fn login(config_override: Option<&Path>) -> Result<()> {
     let is_loopback_http = provider_cfg.redirect_uri.starts_with("http://127.0.0.1")
         || provider_cfg.redirect_uri.starts_with("http://localhost");
 
-    let state = random_state();
+    let state = random_state()?;
 
     if is_loopback_http {
         login_local_listener(&mut provider_cfg, &state).await
@@ -78,19 +96,20 @@ async fn login_local_listener(
     let url = auth::authorize_url(provider_cfg, DEFAULT_SCOPES, state)
         .map_err(|e| anyhow!("build authorize URL: {e}"))?;
 
+    print_requested_scope_consent();
     println!("Opening browser to authorize threads-cli...");
     println!("If it does not open, visit this URL manually:");
     println!("  {url}");
-    let _ = std::process::Command::new("open")
-        .arg(url.as_str())
-        .status();
+    if let Err(error) = super::browser::open(url.as_str()) {
+        eprintln!("could not open browser ({error}); visit the URL above manually");
+    }
 
     let code = server
         .accept_code(state)
         .await
         .map_err(|e| anyhow!("oauth callback: {e}"))?;
 
-    finish_login(provider_cfg, &code).await
+    completion::finish_login(provider_cfg, &code).await
 }
 
 async fn login_manual_paste(
@@ -100,6 +119,7 @@ async fn login_manual_paste(
     let url = auth::authorize_url(provider_cfg, DEFAULT_SCOPES, state)
         .map_err(|e| anyhow!("build authorize URL: {e}"))?;
 
+    print_requested_scope_consent();
     println!("1. Open this URL in your browser and approve the request:");
     println!("   {url}\n");
     println!(
@@ -107,70 +127,40 @@ async fn login_manual_paste(
         provider_cfg.redirect_uri
     );
     println!(
-        "3. Copy the resulting URL (or just the `code=...` parameter) from the browser's\n\
-         address bar and paste it here. (State to match: {state})\n"
+        "3. Copy the full resulting redirect URL from the browser address bar and paste it here.\n"
     );
 
-    let _ = std::process::Command::new("open")
-        .arg(url.as_str())
-        .status();
+    if let Err(error) = super::browser::open(url.as_str()) {
+        eprintln!("could not open browser ({error}); visit the URL above manually");
+    }
 
-    print!("Paste URL or code: ");
+    print!("Paste redirect URL: ");
     io::stdout().flush()?;
     let mut input = String::new();
     io::stdin().read_line(&mut input)?;
-    let (code, returned_state) = parse_code_from_input(input.trim())?;
-    if let Some(rs) = returned_state {
-        if rs != state {
-            return Err(anyhow!(
-                "OAuth state mismatch: got {rs:?}, expected {state:?} — aborting"
-            ));
-        }
-    }
-    finish_login(provider_cfg, &code).await
+    let code = parse_code_from_input(input.trim(), state)?;
+    completion::finish_login(provider_cfg, &code).await
 }
 
-async fn finish_login(provider_cfg: &threads_provider_official::Config, code: &str) -> Result<()> {
-    let short = auth::exchange_code(provider_cfg, code)
-        .await
-        .map_err(|e| anyhow!("exchange code: {e}"))?;
-    let long = auth::upgrade_to_long_lived(provider_cfg, &short.access_token)
-        .await
-        .map_err(|e| anyhow!("upgrade to long-lived: {e}"))?;
-
-    let token = Token::new(
-        long.access_token,
-        long.expires_in,
-        Some(DEFAULT_SCOPES.iter().map(|s| s.to_string()).collect()),
-    );
-    TokenStore::new()
-        .save(&token)
-        .map_err(|e| anyhow!("save token: {e}"))?;
-
-    println!("Authentication complete; token stored.");
-    Ok(())
-}
-
-/// Accept either a bare code (`AQxxxxx...`) or a full URL with
-/// `?code=...&state=...` query params. Returns `(code, Option<state>)`.
-fn parse_code_from_input(input: &str) -> Result<(String, Option<String>)> {
-    if let Ok(url) = url::Url::parse(input) {
-        let mut code = None;
-        let mut state = None;
-        for (k, v) in url.query_pairs() {
-            if k == "code" {
-                code = Some(v.into_owned());
-            } else if k == "state" {
-                state = Some(v.into_owned());
-            }
+fn parse_code_from_input(input: &str, expected_state: &str) -> Result<String> {
+    let url = url::Url::parse(input).map_err(|_| anyhow!("paste the full redirect URL"))?;
+    let mut code = None;
+    let mut state = None;
+    for (key, value) in url.query_pairs() {
+        match key.as_ref() {
+            "code" => code = Some(value.into_owned()),
+            "state" => state = Some(value.into_owned()),
+            _ => {}
         }
-        let code = code.ok_or_else(|| anyhow!("URL has no `code=...` parameter"))?;
-        return Ok((code, state));
     }
-    if input.is_empty() {
-        return Err(anyhow!("empty input"));
+    let code = code.ok_or_else(|| anyhow!("URL has no `code=...` parameter"))?;
+    let state = state.ok_or_else(|| anyhow!("URL has no `state=...` parameter"))?;
+    if state != expected_state {
+        return Err(anyhow!(
+            "OAuth state mismatch: got {state:?}, expected {expected_state:?} — aborting"
+        ));
     }
-    Ok((input.to_string(), None))
+    Ok(code)
 }
 
 fn status() -> Result<()> {
@@ -185,8 +175,14 @@ fn status() -> Result<()> {
             if let Some(exp) = t.expires_in {
                 println!("expires_in:  {exp}s");
             }
-            if let Some(scopes) = t.granted_scopes.as_ref() {
-                println!("scopes:      {}", scopes.join(","));
+            if let Some(user_id) = t.user_id.as_deref() {
+                println!("user_id:     {user_id}");
+            }
+            if let Some(scopes) = t.requested_scopes.as_ref() {
+                println!(
+                    "requested_scopes (not confirmed by Meta): {}",
+                    scopes.join(",")
+                );
             }
             println!("expired:     {}", t.is_expired());
         }
@@ -199,53 +195,34 @@ fn logout() -> Result<()> {
     TokenStore::new()
         .clear()
         .map_err(|e| anyhow!("clear token: {e}"))?;
-    let path = CliConfig::token_path();
-    if path.exists() {
-        fs::remove_file(&path).context("removing token file")?;
-    }
     println!("token cleared");
     Ok(())
 }
 
 /// Short random-ish state string for CSRF protection.
-fn random_state() -> String {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(1);
-    let n = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
-    let c = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let mixed = n ^ c.wrapping_mul(0x9E3779B97F4A7C15);
-    format!("{mixed:x}")
+fn random_state() -> Result<String> {
+    let mut bytes = [0_u8; 32];
+    let mut rng = SysRng;
+    rng.try_fill_bytes(&mut bytes)
+        .map_err(|error| anyhow!("read operating-system entropy for OAuth state: {error}"))?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+fn requested_scope_consent_text() -> String {
+    let scopes = REQUESTED_SCOPE_PURPOSES
+        .iter()
+        .map(|(scope, purpose)| format!("  - {scope}: {purpose}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "threads-cli will request these requested scopes (Meta does not return confirmed grants):\n{scopes}"
+    )
+}
+
+fn print_requested_scope_consent() {
+    println!("{}", requested_scope_consent_text());
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parses_full_redirect_url() {
-        let (code, state) =
-            parse_code_from_input("https://example.com/cb?code=AQx123&state=abc&extra=1").unwrap();
-        assert_eq!(code, "AQx123");
-        assert_eq!(state.as_deref(), Some("abc"));
-    }
-
-    #[test]
-    fn parses_bare_code() {
-        let (code, state) = parse_code_from_input("AQx123").unwrap();
-        assert_eq!(code, "AQx123");
-        assert!(state.is_none());
-    }
-
-    #[test]
-    fn rejects_empty_input() {
-        assert!(parse_code_from_input("").is_err());
-    }
-
-    #[test]
-    fn rejects_url_without_code() {
-        assert!(parse_code_from_input("https://example.com/cb?foo=bar").is_err());
-    }
-}
+#[path = "auth_tests.rs"]
+mod tests;

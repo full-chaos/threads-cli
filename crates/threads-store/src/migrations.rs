@@ -25,6 +25,10 @@ fn migrations() -> Vec<Migration> {
             version: 3,
             apply: migration_v3_deletions,
         },
+        Migration {
+            version: 4,
+            apply: migration_v4_audience,
+        },
     ]
 }
 
@@ -165,6 +169,37 @@ fn migration_v3_deletions(conn: &Connection) -> Result<()> {
     .map_err(StoreError::Sqlite)
 }
 
+fn migration_v4_audience(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS audience_snapshots (
+            id              INTEGER PRIMARY KEY,
+            account_id      TEXT    NOT NULL,
+            observed_at     TEXT    NOT NULL,
+            followers_count INTEGER NOT NULL CHECK (followers_count >= 0),
+            fetch_run_id    TEXT,
+            UNIQUE(account_id, observed_at),
+            FOREIGN KEY (account_id) REFERENCES users(id) ON DELETE CASCADE,
+            FOREIGN KEY (fetch_run_id) REFERENCES fetch_runs(id)
+        );
+        CREATE INDEX IF NOT EXISTS audience_snapshots_account_observed_idx
+            ON audience_snapshots(account_id, observed_at);
+
+        CREATE TABLE IF NOT EXISTS audience_demographics (
+            snapshot_id INTEGER NOT NULL,
+            dimension   TEXT    NOT NULL CHECK (dimension IN ('country','city','age','gender')),
+            bucket      TEXT    NOT NULL,
+            value       INTEGER NOT NULL CHECK (value >= 0),
+            PRIMARY KEY(snapshot_id, dimension, bucket),
+            FOREIGN KEY (snapshot_id) REFERENCES audience_snapshots(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS audience_demographics_snapshot_idx
+            ON audience_demographics(snapshot_id);
+        ",
+    )
+    .map_err(StoreError::Sqlite)
+}
+
 /// Apply all pending migrations to `conn`.  Called by [`Store::open`] on
 /// every connection open; safe to call multiple times (idempotent).
 pub fn run_migrations(conn: &Connection) -> Result<()> {
@@ -191,15 +226,17 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
         if applied.contains(&mig.version) {
             continue;
         }
-        (mig.apply)(conn).map_err(|e| {
+        let tx = conn.unchecked_transaction().map_err(StoreError::Sqlite)?;
+        (mig.apply)(&tx).map_err(|e| {
             StoreError::Migration(format!("migration v{} failed: {e}", mig.version))
         })?;
         let now = chrono::Utc::now().to_rfc3339();
-        conn.execute(
+        tx.execute(
             "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
             rusqlite::params![mig.version, now],
         )
         .map_err(StoreError::Sqlite)?;
+        tx.commit().map_err(StoreError::Sqlite)?;
     }
 
     Ok(())

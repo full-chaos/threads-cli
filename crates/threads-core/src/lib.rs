@@ -14,10 +14,11 @@ pub mod model;
 pub mod provider;
 pub mod publish;
 
-pub use error::{Error, Result};
+pub use error::{Error, PermissionRequirement, Result};
 pub use model::{
-    Cursor, Edge, EdgeKind, FetchRun, Media, MediaKind, Mention, Page, Post, PostId, UrlEntity,
-    User, UserId,
+    AudienceInsightQuery, AudienceInsightResult, AudienceSnapshot, Cursor, DemographicBucket,
+    DemographicDimension, DemographicInsight, Edge, EdgeKind, EngagedAccount, EngagementSort,
+    FetchRun, Media, MediaKind, Mention, Page, Post, PostId, UrlEntity, User, UserId,
 };
 pub use provider::Provider;
 pub use publish::{

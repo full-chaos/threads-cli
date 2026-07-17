@@ -47,6 +47,7 @@ csv = "1.3"
 
 # cli
 clap = { version = "4.5", features = ["derive", "env", "wrap_help"] }
+open = "5"
 
 # storage
 rusqlite = { version = "0.33", features = ["bundled", "chrono", "serde_json"] }
@@ -64,6 +65,7 @@ keyring = { version = "3", default-features = false, features = [
   "sync-secret-service",
 ] }
 dirs = "5"
+libc = "0.2"
 
 # test helpers
 tempfile = "3"

@@ -1,0 +1,14 @@
+{
+  "data": [
+    {
+      "name": "followers_count",
+      "period": "lifetime",
+      "total_value": {
+        "value": 1234
+      },
+      "title": "Followers",
+      "description": "The number of followers for this Threads profile.",
+      "id": "17841400000000000/insights/followers_count/lifetime"
+    }
+  ]
+}

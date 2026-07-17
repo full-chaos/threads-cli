@@ -1,94 +1,35 @@
-use std::{fs, path::PathBuf};
+mod credential_backend;
+mod file_store;
+mod token_model;
 
-use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use std::{path::PathBuf, sync::Arc};
+
+#[cfg(feature = "test-support")]
+use credential_backend::FileOnlyBackend;
+use credential_backend::{CredentialBackend, KeyringBackend};
 use threads_core::{Error, Result};
 
-const KEYRING_SERVICE: &str = "threads-cli";
-const KEYRING_USER: &str = "default";
+pub use token_model::{Token, token_has_scope};
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Token {
-    pub access_token: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub expires_in: Option<i64>,
-    /// Meta's token-exchange endpoint does not return the granted scopes; we
-    /// record what we requested at login time. This is a heuristic, not a
-    /// guarantee — if a request fails with 403/insufficient_scope, re-run
-    /// `auth login`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub granted_scopes: Option<Vec<String>>,
-    pub issued_at: DateTime<Utc>,
-}
-
-impl Token {
-    pub fn new(
-        access_token: impl Into<String>,
-        expires_in: Option<i64>,
-        granted_scopes: Option<Vec<String>>,
-    ) -> Self {
-        Self {
-            access_token: access_token.into(),
-            expires_in,
-            granted_scopes,
-            issued_at: Utc::now(),
-        }
-    }
-
-    pub fn is_expired(&self) -> bool {
-        match self.expires_in {
-            Some(secs) if secs > 0 => {
-                let elapsed = Utc::now()
-                    .signed_duration_since(self.issued_at)
-                    .num_seconds();
-                elapsed >= secs
-            }
-            _ => false,
-        }
-    }
-}
-
-/// Strict scope check: returns `true` ONLY when the token records a
-/// `granted_scopes` list and that list contains `scope`.
-///
-/// Tokens minted before scope-tracking shipped (`granted_scopes = None`) are
-/// treated as missing the scope. This is intentionally strict for write
-/// operations like `threads_delete` — those scopes were added in the same
-/// release as scope tracking, so a `None` token by definition does not have
-/// them. Pre-existing read-only behavior continues to work because read
-/// endpoints don't call this helper.
-pub fn token_has_scope(token: &Token, scope: &str) -> bool {
-    token
-        .granted_scopes
-        .as_ref()
-        .is_some_and(|scopes| scopes.iter().any(|s| s == scope))
-}
-
-/// Persists an access [`Token`] across runs.
-///
-/// Prefers the OS keyring (`keyring` crate, service = "threads-cli"). When
-/// keyring access fails, falls back to a JSON file at
-/// `~/.config/threads-cli/token.json` with strict permissions (0700 on the
-/// parent directory, 0600 on the file itself) on Unix.
 pub struct TokenStore {
     fallback_path: PathBuf,
+    backend: Arc<dyn CredentialBackend>,
 }
 
 impl TokenStore {
     pub fn new() -> Self {
-        // Use XDG config home (same logic as threads-cli's CliConfig) so the
-        // token lives alongside config.toml at ~/.config/threads-cli/ on every
-        // OS, instead of macOS's `~/Library/Application Support`.
         let config_home = std::env::var_os("XDG_CONFIG_HOME")
             .map(PathBuf::from)
-            .filter(|p| !p.as_os_str().is_empty())
+            .filter(|path| !path.as_os_str().is_empty())
             .unwrap_or_else(|| {
                 dirs::home_dir()
                     .unwrap_or_else(|| PathBuf::from("."))
                     .join(".config")
             });
-        let fallback_path = config_home.join("threads-cli").join("token.json");
-        Self { fallback_path }
+        Self {
+            fallback_path: config_home.join("threads-cli").join("token.json"),
+            backend: Arc::new(KeyringBackend),
+        }
     }
 
     pub fn with_fallback_path(mut self, path: PathBuf) -> Self {
@@ -96,47 +37,46 @@ impl TokenStore {
         self
     }
 
+    #[cfg(feature = "test-support")]
+    pub fn file_only_for_tests(self) -> Self {
+        self.with_backend(Arc::new(FileOnlyBackend))
+    }
+
     pub fn save(&self, token: &Token) -> Result<()> {
         let json = serde_json::to_string(token)?;
-        if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER) {
-            if entry.set_password(&json).is_ok() {
-                return Ok(());
-            }
-        }
-        // Fallback: file on disk, restricted to the current user.
-        if let Some(parent) = self.fallback_path.parent() {
-            create_private_dir(parent)?;
-        }
-        write_private_file(&self.fallback_path, json.as_bytes())?;
+        file_store::write_private_file(&self.fallback_path, json.as_bytes())?;
+        let _ = self.backend.save(&json);
         Ok(())
     }
 
     pub fn load(&self) -> Result<Option<Token>> {
-        if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER) {
-            if let Ok(s) = entry.get_password() {
-                let t: Token = serde_json::from_str(&s)?;
-                return Ok(Some(t));
-            }
+        if let Some(json) = file_store::read_private_file(&self.fallback_path)? {
+            return serde_json::from_str(&json).map(Some).map_err(Error::from);
         }
-        if self.fallback_path.exists() {
-            warn_if_world_readable(&self.fallback_path);
-            let s = fs::read_to_string(&self.fallback_path)
-                .map_err(|e| Error::Config(format!("reading token file: {e}")))?;
-            let t: Token = serde_json::from_str(&s)?;
-            return Ok(Some(t));
+        match self.backend.load() {
+            Ok(Some(json)) => serde_json::from_str(&json).map(Some).map_err(Error::from),
+            Ok(None) | Err(_) => Ok(None),
         }
-        Ok(None)
     }
 
     pub fn clear(&self) -> Result<()> {
-        if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER) {
-            let _ = entry.delete_credential();
+        let backend_result = self
+            .backend
+            .clear()
+            .map_err(|error| Error::Config(format!("clearing keyring token: {error}")));
+        let fallback_result = file_store::remove_private_file(&self.fallback_path);
+
+        match (backend_result, fallback_result) {
+            (Err(error), _) => Err(error),
+            (Ok(()), Err(error)) => Err(error),
+            (Ok(()), Ok(())) => Ok(()),
         }
-        if self.fallback_path.exists() {
-            fs::remove_file(&self.fallback_path)
-                .map_err(|e| Error::Config(format!("removing token file: {e}")))?;
-        }
-        Ok(())
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn with_backend(mut self, backend: Arc<dyn CredentialBackend>) -> Self {
+        self.backend = backend;
+        self
     }
 }
 
@@ -146,216 +86,181 @@ impl Default for TokenStore {
     }
 }
 
-// --------------- platform-specific private I/O helpers ---------------
-
-#[cfg(unix)]
-fn create_private_dir(path: &std::path::Path) -> Result<()> {
-    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-
-    if path.exists() {
-        // Tighten permissions defensively; a pre-existing world-readable dir
-        // would expose our token file even if the file itself is 0600.
-        let mut perms = fs::metadata(path)
-            .map_err(|e| Error::Config(format!("stat token dir: {e}")))?
-            .permissions();
-        if perms.mode() & 0o077 != 0 {
-            perms.set_mode(0o700);
-            fs::set_permissions(path, perms)
-                .map_err(|e| Error::Config(format!("chmod token dir: {e}")))?;
-        }
-        return Ok(());
-    }
-    fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(path)
-        .map_err(|e| Error::Config(format!("creating token dir: {e}")))
-}
-
-#[cfg(not(unix))]
-fn create_private_dir(path: &std::path::Path) -> Result<()> {
-    // On Windows, file permissions rely on the NTFS ACL inherited from the
-    // user profile; keyring is the primary store there anyway.
-    fs::create_dir_all(path).map_err(|e| Error::Config(format!("creating token dir: {e}")))
-}
-
-#[cfg(unix)]
-fn write_private_file(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
-    use std::io::Write as _;
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-
-    let mut f = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)
-        .map_err(|e| Error::Config(format!("opening token file: {e}")))?;
-    f.write_all(bytes)
-        .map_err(|e| Error::Config(format!("writing token file: {e}")))?;
-    // Re-assert mode in case the file pre-existed with looser perms.
-    let mut perms = f
-        .metadata()
-        .map_err(|e| Error::Config(format!("stat token file: {e}")))?
-        .permissions();
-    perms.set_mode(0o600);
-    fs::set_permissions(path, perms)
-        .map_err(|e| Error::Config(format!("chmod token file: {e}")))?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn write_private_file(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
-    fs::write(path, bytes).map_err(|e| Error::Config(format!("writing token file: {e}")))
-}
-
-#[cfg(unix)]
-fn warn_if_world_readable(path: &std::path::Path) {
-    use std::os::unix::fs::PermissionsExt;
-    if let Ok(md) = fs::metadata(path) {
-        let mode = md.permissions().mode() & 0o777;
-        if mode & 0o077 != 0 {
-            tracing::warn!(
-                path = %path.display(),
-                mode = format!("{mode:o}"),
-                "token file is group- or world-readable; run `chmod 0600 <path>` to tighten it"
-            );
-        }
-    }
-}
-
-#[cfg(not(unix))]
-fn warn_if_world_readable(_path: &std::path::Path) {}
-
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+
     use super::*;
+    use crate::token_store::credential_backend::CredentialResult;
     use tempfile::TempDir;
+
+    struct FailingBackend;
+
+    impl CredentialBackend for FailingBackend {
+        fn save(&self, _: &str) -> CredentialResult<()> {
+            Err("unavailable".into())
+        }
+
+        fn load(&self) -> CredentialResult<Option<String>> {
+            Err("unavailable".into())
+        }
+
+        fn clear(&self) -> CredentialResult<()> {
+            Err("unavailable".into())
+        }
+    }
+
+    struct StaleBackend;
+
+    impl CredentialBackend for StaleBackend {
+        fn save(&self, _: &str) -> CredentialResult<()> {
+            Ok(())
+        }
+
+        fn load(&self) -> CredentialResult<Option<String>> {
+            Ok(Some(
+                r#"{"access_token":"stale","issued_at":"2026-01-01T00:00:00Z"}"#.into(),
+            ))
+        }
+
+        fn clear(&self) -> CredentialResult<()> {
+            Err("unavailable".into())
+        }
+    }
+
+    struct InMemoryBackend(Mutex<Option<String>>);
+
+    impl CredentialBackend for InMemoryBackend {
+        fn save(&self, secret: &str) -> CredentialResult<()> {
+            *self.0.lock().map_err(|error| error.to_string())? = Some(secret.into());
+            Ok(())
+        }
+
+        fn load(&self) -> CredentialResult<Option<String>> {
+            Ok(self.0.lock().map_err(|error| error.to_string())?.clone())
+        }
+
+        fn clear(&self) -> CredentialResult<()> {
+            self.0.lock().map_err(|error| error.to_string())?.take();
+            Ok(())
+        }
+    }
+
+    struct AccessTrackingBackend(AtomicUsize);
+
+    impl CredentialBackend for AccessTrackingBackend {
+        fn save(&self, _: &str) -> CredentialResult<()> {
+            Ok(())
+        }
+
+        fn load(&self) -> CredentialResult<Option<String>> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Ok(None)
+        }
+
+        fn clear(&self) -> CredentialResult<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn save_keeps_file_fallback_when_keyring_write_fails() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("token.json");
+        let store = TokenStore::new()
+            .with_fallback_path(path.clone())
+            .with_backend(Arc::new(FailingBackend));
+
+        store.save(&Token::new("current", None, None)).unwrap();
+
+        assert!(path.exists());
+        assert_eq!(store.load().unwrap().unwrap().access_token, "current");
+    }
+
+    #[test]
+    fn load_returns_none_when_keyring_read_fails_without_a_file() {
+        let temp = TempDir::new().unwrap();
+        let store = TokenStore::new()
+            .with_fallback_path(temp.path().join("token.json"))
+            .with_backend(Arc::new(FailingBackend));
+
+        assert!(store.load().unwrap().is_none());
+    }
+
+    #[test]
+    fn clear_removes_fallback_when_credential_backend_delete_fails() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("token.json");
+        let store = TokenStore::new()
+            .with_fallback_path(path.clone())
+            .with_backend(Arc::new(StaleBackend));
+        store.save(&Token::new("current", None, None)).unwrap();
+
+        let error = store.clear().expect_err("backend failure must be reported");
+        assert!(
+            matches!(error, Error::Config(message) if message.contains("clearing keyring token: unavailable"))
+        );
+        assert!(
+            !path.exists(),
+            "fallback token must be removed despite backend failure"
+        );
+    }
+
+    #[test]
+    fn clear_prefers_credential_backend_error_when_both_cleanup_steps_fail() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("token.json");
+        std::fs::create_dir(&path).unwrap();
+        let store = TokenStore::new()
+            .with_fallback_path(path.clone())
+            .with_backend(Arc::new(FailingBackend));
+
+        let error = store
+            .clear()
+            .expect_err("both cleanup failures must be reported");
+
+        assert!(
+            error
+                .to_string()
+                .contains("clearing keyring token: unavailable")
+        );
+        assert!(path.is_dir());
+    }
 
     #[test]
     fn roundtrip_via_file_fallback() {
-        let tmp = TempDir::new().unwrap();
-        let store = TokenStore::new().with_fallback_path(tmp.path().join("token.json"));
-        let t = Token::new("abcd", Some(3600), Some(vec!["threads_basic".into()]));
-        store.save(&t).unwrap();
-        let loaded = store.load().unwrap().expect("token should load");
+        let temp = TempDir::new().unwrap();
+        let store = TokenStore::new()
+            .with_fallback_path(temp.path().join("token.json"))
+            .with_backend(Arc::new(InMemoryBackend(Mutex::new(None))));
+        let token = Token::new("abcd", Some(3600), Some(vec!["threads_basic".into()]));
+        store.save(&token).unwrap();
+        let loaded = store.load().unwrap().unwrap();
         assert_eq!(loaded.access_token, "abcd");
-        assert_eq!(
-            loaded.granted_scopes.as_deref(),
-            Some(&["threads_basic".to_string()][..])
-        );
         store.clear().unwrap();
     }
 
-    #[test]
-    fn expiry_detection() {
-        let mut t = Token::new("x", Some(1), None);
-        t.issued_at = Utc::now() - chrono::Duration::seconds(10);
-        assert!(t.is_expired());
-        let t2 = Token::new("y", Some(3600), None);
-        assert!(!t2.is_expired());
-    }
-
-    #[test]
-    fn legacy_token_without_scopes_lacks_new_scopes() {
-        // A token saved before scope tracking shipped has `granted_scopes = None`.
-        // For new write scopes like `threads_delete`, that MUST read as missing
-        // so the CLI can guide the user to re-run `auth login`.
-        let t: Token =
-            serde_json::from_str(r#"{"access_token":"t","issued_at":"2026-01-01T00:00:00Z"}"#)
-                .unwrap();
-
-        assert!(t.granted_scopes.is_none());
-        assert!(!token_has_scope(&t, "threads_delete"));
-    }
-
-    #[test]
-    fn token_has_scope_checks_recorded_scopes() {
-        let t = Token::new(
-            "t",
-            None,
-            Some(vec!["threads_basic".into(), "threads_delete".into()]),
-        );
-
-        assert!(token_has_scope(&t, "threads_delete"));
-        assert!(!token_has_scope(&t, "threads_publish"));
-    }
-
     #[cfg(unix)]
     #[test]
-    fn file_fallback_writes_0600_file_and_0700_dir() {
-        use std::os::unix::fs::PermissionsExt;
+    fn load_rejects_unsafe_file_without_accessing_credential_backend() {
+        use std::os::unix::fs::symlink;
 
-        let tmp = TempDir::new().unwrap();
-        let dir = tmp.path().join("threads-cli");
-        let file = dir.join("token.json");
-        let store = TokenStore::new().with_fallback_path(file.clone());
+        let temp = TempDir::new().unwrap();
+        let victim = temp.path().join("victim.json");
+        let path = temp.path().join("token.json");
+        std::fs::write(&victim, r#"{"access_token":"victim"}"#).unwrap();
+        symlink(&victim, &path).unwrap();
+        let backend = Arc::new(AccessTrackingBackend(AtomicUsize::new(0)));
+        let store = TokenStore::new()
+            .with_fallback_path(path)
+            .with_backend(backend.clone());
 
-        // Pretend keyring is unavailable by choosing a service name that
-        // would fail — but keyring may still succeed on dev machines. To
-        // guarantee the file write path runs, call the helpers directly.
-        create_private_dir(&dir).unwrap();
-        write_private_file(
-            &file,
-            b"{\"access_token\":\"t\",\"issued_at\":\"2026-01-01T00:00:00Z\"}",
-        )
-        .unwrap();
+        let error = store.load().expect_err("unsafe token file must fail load");
 
-        let dir_mode = fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
-        assert_eq!(
-            dir_mode, 0o700,
-            "parent dir should be 0700, got {dir_mode:o}"
-        );
-
-        let file_mode = fs::metadata(&file).unwrap().permissions().mode() & 0o777;
-        assert_eq!(
-            file_mode, 0o600,
-            "token file should be 0600, got {file_mode:o}"
-        );
-
-        // Keep the store struct alive so `with_fallback_path` isn't dead-code.
-        let _ = store;
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn preexisting_loose_dir_is_tightened() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let tmp = TempDir::new().unwrap();
-        let dir = tmp.path().join("loose");
-        fs::create_dir_all(&dir).unwrap();
-        let mut perms = fs::metadata(&dir).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&dir, perms).unwrap();
-
-        create_private_dir(&dir).unwrap();
-
-        let mode = fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
-        assert_eq!(
-            mode, 0o700,
-            "loose dir should have been tightened to 0700, got {mode:o}"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn preexisting_loose_file_is_tightened() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let tmp = TempDir::new().unwrap();
-        let file = tmp.path().join("token.json");
-        fs::write(&file, b"{}").unwrap();
-        let mut perms = fs::metadata(&file).unwrap().permissions();
-        perms.set_mode(0o644);
-        fs::set_permissions(&file, perms).unwrap();
-
-        write_private_file(&file, b"{}").unwrap();
-
-        let mode = fs::metadata(&file).unwrap().permissions().mode() & 0o777;
-        assert_eq!(
-            mode, 0o600,
-            "loose file should have been tightened to 0600, got {mode:o}"
-        );
+        assert!(error.to_string().contains("unsafe token file"));
+        assert_eq!(backend.0.load(Ordering::Relaxed), 0);
     }
 }

@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 
-use serde::{Deserialize, Deserializer};
 use threads_core::{Error, Result};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -10,10 +9,60 @@ use url::Url;
 
 use crate::config::Config;
 
+mod transport;
+
+#[cfg(test)]
+use transport::safe_network_error;
+pub use transport::{TokenResponse, refresh_long_lived};
+
 const AUTHORIZE_BASE: &str = "https://threads.net/oauth/authorize";
 const TOKEN_EXCHANGE_BASE: &str = "https://graph.threads.net/oauth/access_token";
 const ACCESS_TOKEN_BASE: &str = "https://graph.threads.net/access_token";
-const REFRESH_BASE: &str = "https://graph.threads.net/refresh_access_token";
+
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Clone, Debug)]
+pub struct OAuthEndpoints {
+    token_exchange: Url,
+    long_lived_upgrade: Url,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl OAuthEndpoints {
+    pub fn new(token_exchange: String, long_lived_upgrade: String) -> Result<Self> {
+        Ok(Self {
+            token_exchange: Url::parse(&token_exchange)?,
+            long_lived_upgrade: Url::parse(&long_lived_upgrade)?,
+        })
+    }
+}
+
+pub async fn exchange_code(config: &Config, code: &str) -> Result<TokenResponse> {
+    let endpoint = Url::parse(TOKEN_EXCHANGE_BASE)?;
+    transport::exchange_code_at(config, code, &endpoint).await
+}
+
+pub async fn upgrade_to_long_lived(config: &Config, short_token: &str) -> Result<TokenResponse> {
+    let endpoint = Url::parse(ACCESS_TOKEN_BASE)?;
+    transport::upgrade_to_long_lived_at(config, short_token, &endpoint).await
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub async fn exchange_code_with_endpoints(
+    config: &Config,
+    code: &str,
+    endpoints: &OAuthEndpoints,
+) -> Result<TokenResponse> {
+    transport::exchange_code_at(config, code, &endpoints.token_exchange).await
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub async fn upgrade_to_long_lived_with_endpoints(
+    config: &Config,
+    short_token: &str,
+    endpoints: &OAuthEndpoints,
+) -> Result<TokenResponse> {
+    transport::upgrade_to_long_lived_at(config, short_token, &endpoints.long_lived_upgrade).await
+}
 
 /// Default OAuth scopes covering v1 MVP behavior.
 pub const DEFAULT_SCOPES: &[&str] = &[
@@ -21,6 +70,8 @@ pub const DEFAULT_SCOPES: &[&str] = &[
     "threads_read_replies",
     "threads_delete",
     "threads_content_publish",
+    "threads_manage_insights",
+    "threads_manage_mentions",
 ];
 
 /// Build the URL the user must visit to grant authorization.
@@ -33,101 +84,6 @@ pub fn authorize_url(cfg: &Config, scopes: &[&str], state: &str) -> Result<Url> 
         .append_pair("scope", &scopes.join(","))
         .append_pair("state", state);
     Ok(url)
-}
-
-#[derive(Clone, Debug, Deserialize)]
-pub struct TokenResponse {
-    pub access_token: String,
-    #[serde(default)]
-    pub token_type: Option<String>,
-    #[serde(default)]
-    pub expires_in: Option<i64>,
-    #[serde(default, deserialize_with = "deserialize_id_flex")]
-    pub user_id: Option<String>,
-}
-
-/// Meta returns numeric IDs as a JSON integer in the OAuth token response but
-/// as a JSON string in most Graph API responses. Accept either and normalize
-/// to `String` so downstream code has one type.
-fn deserialize_id_flex<'de, D>(de: D) -> std::result::Result<Option<String>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum IdFormat {
-        Str(String),
-        I(i64),
-        U(u64),
-    }
-    let opt = Option::<IdFormat>::deserialize(de)?;
-    Ok(opt.map(|v| match v {
-        IdFormat::Str(s) => s,
-        IdFormat::I(n) => n.to_string(),
-        IdFormat::U(n) => n.to_string(),
-    }))
-}
-
-/// Exchange an authorization code for a short-lived access token.
-pub async fn exchange_code(cfg: &Config, code: &str) -> Result<TokenResponse> {
-    let client = reqwest::Client::new();
-    let form = [
-        ("client_id", cfg.app_id.as_str()),
-        ("client_secret", cfg.app_secret.as_str()),
-        ("grant_type", "authorization_code"),
-        ("redirect_uri", cfg.redirect_uri.as_str()),
-        ("code", code),
-    ];
-    let resp = client
-        .post(TOKEN_EXCHANGE_BASE)
-        .form(&form)
-        .send()
-        .await
-        .map_err(|e| Error::Network(e.to_string()))?;
-    parse_token_response(resp).await
-}
-
-/// Upgrade a short-lived token to a long-lived one (60d).
-pub async fn upgrade_to_long_lived(cfg: &Config, short_token: &str) -> Result<TokenResponse> {
-    let mut url = Url::parse(ACCESS_TOKEN_BASE)?;
-    url.query_pairs_mut()
-        .append_pair("grant_type", "th_exchange_token")
-        .append_pair("client_secret", &cfg.app_secret)
-        .append_pair("access_token", short_token);
-    let resp = reqwest::Client::new()
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| Error::Network(e.to_string()))?;
-    parse_token_response(resp).await
-}
-
-/// Refresh a long-lived token (extends expiry by up to 60d).
-pub async fn refresh_long_lived(_cfg: &Config, token: &str) -> Result<TokenResponse> {
-    let mut url = Url::parse(REFRESH_BASE)?;
-    url.query_pairs_mut()
-        .append_pair("grant_type", "th_refresh_token")
-        .append_pair("access_token", token);
-    let resp = reqwest::Client::new()
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| Error::Network(e.to_string()))?;
-    parse_token_response(resp).await
-}
-
-async fn parse_token_response(resp: reqwest::Response) -> Result<TokenResponse> {
-    let status = resp.status();
-    let raw_body = resp
-        .text()
-        .await
-        .map_err(|e| Error::Network(e.to_string()))?;
-    let safe_body = crate::redact::redact(&raw_body);
-    if !status.is_success() {
-        return Err(Error::Auth(format!("token endpoint {status}: {safe_body}")));
-    }
-    serde_json::from_str(&raw_body)
-        .map_err(|e| Error::Parse(format!("token response: {e}; body: {safe_body}")))
 }
 
 /// Run a one-shot local HTTP server that receives Meta's redirect after the
@@ -359,6 +315,21 @@ mod tests {
     }
 
     #[test]
+    fn default_scopes_match_the_approved_broad_consent() {
+        assert_eq!(
+            DEFAULT_SCOPES,
+            [
+                "threads_basic",
+                "threads_read_replies",
+                "threads_delete",
+                "threads_content_publish",
+                "threads_manage_insights",
+                "threads_manage_mentions",
+            ]
+        );
+    }
+
+    #[test]
     fn parse_oauth_request_extracts_code_and_state() {
         let req = "GET /callback?code=abc123&state=xyz HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n";
         let (code, state) = parse_oauth_request(req).unwrap();
@@ -378,6 +349,22 @@ mod tests {
         assert_eq!(percent_decode("hello%20world"), "hello world");
         assert_eq!(percent_decode("a%2Bb"), "a+b");
         assert_eq!(percent_decode("x+y"), "x y");
+    }
+
+    #[tokio::test]
+    async fn network_errors_strip_bearer_url_secrets() {
+        let error = reqwest::Client::new()
+            .get("http://127.0.0.1:1/?access_token=secret-token&client_secret=secret-client")
+            .send()
+            .await
+            .unwrap_err();
+
+        let safe = safe_network_error(error);
+
+        assert!(!safe.contains("secret-token"));
+        assert!(!safe.contains("secret-client"));
+        assert!(!safe.contains("access_token"));
+        assert!(!safe.contains("client_secret"));
     }
 
     #[tokio::test]

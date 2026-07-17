@@ -64,10 +64,43 @@ pub struct ChildrenDto {
     pub data: Vec<PostDto>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct InsightsEnvelope {
+    pub data: Vec<InsightDto>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct InsightDto {
+    pub name: String,
+    pub total_value: TotalValueDto,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct TotalValueDto {
+    #[serde(default)]
+    pub value: Option<u64>,
+    #[serde(default)]
+    pub breakdowns: Vec<InsightBreakdownDto>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct InsightBreakdownDto {
+    #[serde(default)]
+    pub dimension_keys: Vec<String>,
+    #[serde(default)]
+    pub results: Vec<InsightBreakdownResultDto>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct InsightBreakdownResultDto {
+    #[serde(default)]
+    pub dimension_values: Vec<String>,
+    pub value: u64,
+}
+
 /// Pagination envelope: `{ data: [...], paging: { cursors: { before, after } } }`.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Envelope<T> {
-    #[serde(default = "Vec::new")]
     pub data: Vec<T>,
     #[serde(default)]
     pub paging: Option<Paging>,
@@ -154,6 +187,18 @@ mod tests {
     }
 
     #[test]
+    fn rejects_post_envelope_without_required_data() {
+        // Given: a response that omits the documented collection payload.
+        let missing_data = r#"{"paging":{"cursors":{"after":"CURSOR"}}}"#;
+
+        // When: it crosses the post-envelope boundary.
+        let result = serde_json::from_str::<Envelope<PostDto>>(missing_data);
+
+        // Then: it cannot become a misleading empty page.
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn parses_reply_post_with_root_and_replied_to() {
         let v = r#"{
             "id":"r1","text":"hi",
@@ -216,5 +261,123 @@ mod tests {
         let r: PublishingLimitResp = serde_json::from_str(inner).unwrap();
         assert_eq!(r.quota_usage, 0);
         assert_eq!(r.config.quota_total, 250);
+    }
+
+    #[test]
+    fn parses_followers_count_fixture() {
+        // Given: the official followers-count response fixture.
+        let fixture = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../threads-ingest/tests/fixtures/audience_followers_count.json"
+        ));
+
+        // When: the response crosses the Insights DTO boundary.
+        let insights: InsightsEnvelope = serde_json::from_str(fixture).unwrap();
+
+        // Then: the typed value remains available without raw JSON traversal.
+        assert_eq!(insights.data[0].name, "followers_count");
+        assert_eq!(insights.data[0].total_value.value, Some(1234));
+    }
+
+    #[test]
+    fn parses_every_demographic_fixture() {
+        // Given: one official fixture for each supported breakdown dimension.
+        let fixtures = [
+            ("country", "audience_demographics_country.json"),
+            ("city", "audience_demographics_city.json"),
+            ("age", "audience_demographics_age.json"),
+            ("gender", "audience_demographics_gender.json"),
+        ];
+
+        // When: each fixture crosses the Insights DTO boundary.
+        for (dimension, file_name) in fixtures {
+            let fixture_path = format!(
+                "{}/../threads-ingest/tests/fixtures/{file_name}",
+                env!("CARGO_MANIFEST_DIR")
+            );
+            let fixture = std::fs::read_to_string(fixture_path).unwrap();
+            let insights: InsightsEnvelope = serde_json::from_str(&fixture).unwrap();
+
+            // Then: its breakdown is typed with the documented dimension.
+            assert_eq!(
+                insights.data[0].total_value.breakdowns[0].dimension_keys,
+                vec![dimension.to_string()]
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_total_value_followers_count_and_rejects_legacy_values() {
+        // Given: the documented Total Value envelope and the obsolete time-series shape.
+        let documented = r#"{
+            "data":[{
+                "name":"followers_count",
+                "total_value":{"value":1234}
+            }]
+        }"#;
+        let obsolete = r#"{
+            "data":[{
+                "name":"followers_count",
+                "values":[{"value":1234}]
+            }]
+        }"#;
+
+        // When: each payload crosses the insight DTO boundary.
+        let documented_result = serde_json::from_str::<InsightsEnvelope>(documented);
+        let obsolete_result = serde_json::from_str::<InsightsEnvelope>(obsolete);
+
+        // Then: only the documented Total Value envelope is accepted.
+        assert!(documented_result.is_ok());
+        assert!(obsolete_result.is_err());
+    }
+
+    #[test]
+    fn accepts_total_value_demographics_and_rejects_root_breakdowns() {
+        // Given: documented nested Total Value breakdowns and the obsolete root breakdown shape.
+        let documented = r#"{
+            "data":[{
+                "name":"follower_demographics",
+                "total_value":{"breakdowns":[{
+                    "dimension_keys":["country"],
+                    "results":[{"dimension_values":["US"],"value":900}]
+                }]}
+            }]
+        }"#;
+        let obsolete = r#"{
+            "data":[{
+                "name":"follower_demographics",
+                "total_value":900,
+                "breakdowns":[{
+                    "dimension_keys":["country"],
+                    "results":[{"dimension_values":["US"],"value":900}]
+                }]
+            }]
+        }"#;
+
+        // When: each payload crosses the insight DTO boundary.
+        let documented_result = serde_json::from_str::<InsightsEnvelope>(documented);
+        let obsolete_result = serde_json::from_str::<InsightsEnvelope>(obsolete);
+
+        // Then: only the documented nested Total Value shape is accepted.
+        assert!(documented_result.is_ok());
+        assert!(obsolete_result.is_err());
+    }
+
+    #[test]
+    fn rejects_missing_or_noninteger_insight_data() {
+        // Given: malformed and noninteger Insights responses.
+        let malformed = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../threads-ingest/tests/fixtures/audience_malformed.json"
+        ));
+        let noninteger = r#"{"data":[{"name":"followers_count","total_value":{"value":"many"}}]}"#;
+
+        // When: each response crosses the DTO boundary.
+        let missing_data = serde_json::from_str::<InsightsEnvelope>(malformed);
+        let invalid_value = serde_json::from_str::<InsightsEnvelope>(noninteger);
+
+        // Then: both fail at that boundary.
+        assert!(missing_data.is_err());
+        assert!(invalid_value.is_err());
     }
 }

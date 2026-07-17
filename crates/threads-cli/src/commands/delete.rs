@@ -7,7 +7,7 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, NaiveDate, Utc};
 use threads_core::{Error as CoreError, Post, Provider};
-use threads_provider_official::{TokenStore, token_store::token_has_scope};
+use threads_provider_official::TokenStore;
 use threads_store::PostKind;
 
 use crate::cli::{DeleteArgs, DeleteCommand};
@@ -45,11 +45,8 @@ async fn run_kind(
     let token = TokenStore::new()
         .load()
         .map_err(|e| anyhow!("read token: {e}"))?;
-    match token {
-        Some(token) if token_has_scope(&token, "threads_delete") => {}
-        Some(_) => bail!("stored token lacks `threads_delete` scope; run `threads-cli auth login`"),
-        None => bail!("no stored token; run `threads-cli auth login`"),
-    }
+    let token = token.ok_or_else(|| anyhow!("no stored token; run `threads-cli auth login`"))?;
+    crate::commands::require_recorded_scopes(&token, &["threads_delete"])?;
 
     let cli_cfg = crate::commands::load_config(config_override)?;
     let store = crate::commands::open_store(&cli_cfg, db_override)?;

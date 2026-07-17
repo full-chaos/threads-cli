@@ -49,6 +49,13 @@ fields = [
     "is_quote_post",
 ]
 
+[[objects]]
+name = "user/insights"
+path = "/v1.0/{threads-user-id}/threads_insights"
+method = "GET"
+permission = "threads_manage_insights"
+fields = ["followers_count", "follower_demographics"]
+
 # ------------------------------------------------------------------
 # Edges (paginated collections)
 # ------------------------------------------------------------------
@@ -91,6 +98,28 @@ fields = [
     "replied_to",
     "is_reply",
     "hide_status",
+]
+
+[[edges]]
+name = "user/mentions"
+path = "/v1.0/{threads-user-id}/mentions"
+method = "GET"
+permission = "threads_manage_mentions"
+paginated = true
+fields = [
+    "id",
+    "media_product_type",
+    "media_type",
+    "media_url",
+    "permalink",
+    "owner",
+    "username",
+    "text",
+    "timestamp",
+    "shortcode",
+    "thumbnail_url",
+    "children",
+    "is_quote_post",
 ]
 
 [[edges]]

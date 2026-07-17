@@ -5,17 +5,36 @@
 //! paginates fully, deduplicates by `PostId`, and batch-upserts via
 //! `StoreWrite`.
 
-use std::{collections::HashSet, sync::Arc};
+use std::sync::Arc;
 
 use chrono::Utc;
-use threads_core::{Cursor, FetchRun, PostId, Provider, Result};
-use tracing::info;
+use threads_core::{FetchRun, PostId, Provider, Result, UserId};
 use uuid::Uuid;
 
 use crate::{normalizer::Normalizer, store_shim::StoreWrite};
 
 /// Maximum posts to upsert in a single `StoreWrite::upsert_posts` call.
 const BATCH_SIZE: usize = 100;
+
+mod audience_refresh;
+mod base_ingest;
+mod engagement;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MentionIngestWarning {
+    MissingAuthenticatedUsername,
+    PermissionDenied(String),
+    ApiFailure(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AudienceRefreshSummary {
+    pub account_id: UserId,
+    pub followers_count: u64,
+    pub demographics_count: usize,
+    pub mentions_ingested: u64,
+    pub mention_warning: Option<MentionIngestWarning>,
+}
 
 /// Drives the full `provider → normalizer → store` pipeline.
 pub struct Ingestor<P: Provider + 'static, S: StoreWrite + 'static> {
@@ -43,44 +62,9 @@ impl<P: Provider + 'static, S: StoreWrite + 'static> Ingestor<P, S> {
     /// 4. Batch-upserts 100 at a time.
     /// 5. Records the `FetchRun` in the store (start + end).
     pub async fn ingest_me(&self) -> Result<FetchRun> {
-        let run_id = Uuid::new_v4().to_string();
-        let provider_name = self.provider.name().to_string();
-        let started_at = Utc::now();
-
-        let run = FetchRun {
-            id: run_id.clone(),
-            provider: provider_name,
-            started_at,
-            finished_at: None,
-            posts_fetched: 0,
-            error: None,
-        };
-        self.store.record_fetch_run_start(&run)?;
-
-        let result = self.run_ingest_me(&run_id).await;
-
-        match result {
-            Ok(count) => {
-                let finished_at = Utc::now();
-                self.store
-                    .record_fetch_run_end(&run_id, finished_at, count, None)?;
-                Ok(FetchRun {
-                    id: run_id,
-                    provider: run.provider,
-                    started_at,
-                    finished_at: Some(finished_at),
-                    posts_fetched: count,
-                    error: None,
-                })
-            }
-            Err(err) => {
-                let finished_at = Utc::now();
-                let err_str = err.to_string();
-                self.store
-                    .record_fetch_run_end(&run_id, finished_at, 0, Some(&err_str))?;
-                Err(err)
-            }
-        }
+        let run = self.start_fetch_run()?;
+        let result = self.run_ingest_me(&run.id).await;
+        self.finish_fetch_run(run, result)
     }
 
     /// Ingest replies to every post authored by the authenticated user,
@@ -94,245 +78,51 @@ impl<P: Provider + 'static, S: StoreWrite + 'static> Ingestor<P, S> {
     ///
     /// Requires a prior `ingest_me()` to populate the seed set.
     pub async fn ingest_engagement(&self, max_depth: u32) -> Result<FetchRun> {
-        let run_id = Uuid::new_v4().to_string();
-        let provider_name = self.provider.name().to_string();
-        let started_at = Utc::now();
-        let run = FetchRun {
-            id: run_id.clone(),
-            provider: provider_name,
-            started_at,
-            finished_at: None,
-            posts_fetched: 0,
-            error: None,
-        };
-        self.store.record_fetch_run_start(&run)?;
-
-        let result = self.run_ingest_engagement(&run_id, max_depth).await;
-        let finished_at = Utc::now();
-        match result {
-            Ok(count) => {
-                self.store
-                    .record_fetch_run_end(&run_id, finished_at, count, None)?;
-                Ok(FetchRun {
-                    id: run_id,
-                    provider: run.provider,
-                    started_at,
-                    finished_at: Some(finished_at),
-                    posts_fetched: count,
-                    error: None,
-                })
-            }
-            Err(err) => {
-                let err_str = err.to_string();
-                self.store
-                    .record_fetch_run_end(&run_id, finished_at, 0, Some(&err_str))?;
-                Err(err)
-            }
-        }
+        let run = self.start_fetch_run()?;
+        let result = self.run_ingest_engagement(&run.id, max_depth).await;
+        self.finish_fetch_run(run, result)
     }
 
     /// Ingest a single thread (root post + all replies).
     ///
     /// Fetches replies for `root`, normalizing with the root's `PostId` as hint.
     pub async fn ingest_thread(&self, root: &PostId) -> Result<FetchRun> {
-        let run_id = Uuid::new_v4().to_string();
-        let provider_name = self.provider.name().to_string();
-        let started_at = Utc::now();
+        let run = self.start_fetch_run()?;
+        let result = self.run_ingest_thread(&run.id, root).await;
+        self.finish_fetch_run(run, result)
+    }
 
+    fn start_fetch_run(&self) -> Result<FetchRun> {
         let run = FetchRun {
-            id: run_id.clone(),
-            provider: provider_name,
-            started_at,
+            id: Uuid::new_v4().to_string(),
+            provider: self.provider.name().to_string(),
+            started_at: Utc::now(),
             finished_at: None,
             posts_fetched: 0,
             error: None,
         };
         self.store.record_fetch_run_start(&run)?;
+        Ok(run)
+    }
 
-        let result = self.run_ingest_thread(&run_id, root).await;
-
+    fn finish_fetch_run(&self, run: FetchRun, result: Result<u64>) -> Result<FetchRun> {
+        let finished_at = Utc::now();
         match result {
-            Ok(count) => {
-                let finished_at = Utc::now();
+            Ok(posts_fetched) => {
                 self.store
-                    .record_fetch_run_end(&run_id, finished_at, count, None)?;
+                    .record_fetch_run_end(&run.id, finished_at, posts_fetched, None)?;
                 Ok(FetchRun {
-                    id: run_id,
-                    provider: run.provider,
-                    started_at,
                     finished_at: Some(finished_at),
-                    posts_fetched: count,
-                    error: None,
+                    posts_fetched,
+                    ..run
                 })
             }
-            Err(err) => {
-                let finished_at = Utc::now();
-                let err_str = err.to_string();
+            Err(error) => {
+                let error_text = error.to_string();
                 self.store
-                    .record_fetch_run_end(&run_id, finished_at, 0, Some(&err_str))?;
-                Err(err)
+                    .record_fetch_run_end(&run.id, finished_at, 0, Some(&error_text))?;
+                Err(error)
             }
         }
-    }
-
-    // --- private helpers ---
-
-    async fn run_ingest_me(&self, run_id: &str) -> Result<u64> {
-        // Persist the authenticated user's profile so the users table has
-        // username/name/bio (and so author resolution can run later).
-        let me = self.provider.fetch_me().await?;
-        self.store.upsert_user(&me)?;
-        if let Some(username) = &me.username {
-            self.store.resolve_author(username, &me.id)?;
-        }
-
-        let mut seen: HashSet<PostId> = HashSet::new();
-        let mut batch = Vec::new();
-        let mut total: u64 = 0;
-
-        // Phase 1 — own top-level threads.
-        let mut cursor: Option<Cursor> = None;
-        let mut page_num = 0usize;
-        loop {
-            page_num += 1;
-            info!(page = page_num, edge = "me/threads", "fetching page");
-            let page = self.provider.fetch_my_threads(cursor).await?;
-            let has_next = page.next.is_some();
-            for post in page.items {
-                if seen.insert(post.id.clone()) {
-                    batch.push(post);
-                }
-                if batch.len() >= BATCH_SIZE {
-                    let written = self.store.upsert_posts(&batch, Some(run_id))?;
-                    total += written as u64;
-                    batch.clear();
-                }
-            }
-            cursor = page.next;
-            if !has_next {
-                break;
-            }
-        }
-
-        // Phase 2 — own replies (replies I made to other posts).
-        let mut cursor: Option<Cursor> = None;
-        let mut page_num = 0usize;
-        loop {
-            page_num += 1;
-            info!(page = page_num, edge = "me/replies", "fetching page");
-            let page = self.provider.fetch_my_replies(cursor).await?;
-            let has_next = page.next.is_some();
-            for post in page.items {
-                if seen.insert(post.id.clone()) {
-                    batch.push(post);
-                }
-                if batch.len() >= BATCH_SIZE {
-                    let written = self.store.upsert_posts(&batch, Some(run_id))?;
-                    total += written as u64;
-                    batch.clear();
-                }
-            }
-            cursor = page.next;
-            if !has_next {
-                break;
-            }
-        }
-
-        // Flush remaining.
-        if !batch.is_empty() {
-            let written = self.store.upsert_posts(&batch, Some(run_id))?;
-            total += written as u64;
-        }
-
-        Ok(total)
-    }
-
-    async fn run_ingest_engagement(&self, run_id: &str, max_depth: u32) -> Result<u64> {
-        // Seed: every post in the store authored by the authenticated user.
-        let me = self.provider.fetch_me().await?;
-        self.store.upsert_user(&me)?;
-        if let Some(username) = &me.username {
-            self.store.resolve_author(username, &me.id)?;
-        }
-        let seeds = self.store.posts_by_author(&me.id)?;
-        info!(
-            seeds = seeds.len(),
-            author = %me.id,
-            max_depth,
-            "ingest_engagement: BFS descending fetch_replies from every post I authored"
-        );
-
-        let mut seen: HashSet<PostId> = HashSet::with_capacity(seeds.len() * 4);
-        for s in &seeds {
-            seen.insert(s.clone());
-        }
-
-        // BFS queue: (post_id, depth_from_seed).
-        let mut frontier: std::collections::VecDeque<(PostId, u32)> =
-            seeds.into_iter().map(|id| (id, 0)).collect();
-
-        let mut batch = Vec::with_capacity(BATCH_SIZE);
-        let mut total: u64 = 0;
-        while let Some((pid, depth)) = frontier.pop_front() {
-            if depth >= max_depth {
-                continue;
-            }
-            let mut cursor: Option<Cursor> = None;
-            loop {
-                let page = self.provider.fetch_replies(&pid, cursor).await?;
-                let has_next = page.next.is_some();
-                for reply in page.items {
-                    if !seen.insert(reply.id.clone()) {
-                        continue; // already seen — skip.
-                    }
-                    frontier.push_back((reply.id.clone(), depth + 1));
-                    batch.push(reply);
-                    if batch.len() >= BATCH_SIZE {
-                        total += self.store.upsert_posts(&batch, Some(run_id))? as u64;
-                        batch.clear();
-                    }
-                }
-                cursor = page.next;
-                if !has_next {
-                    break;
-                }
-            }
-        }
-        if !batch.is_empty() {
-            total += self.store.upsert_posts(&batch, Some(run_id))? as u64;
-        }
-        Ok(total)
-    }
-
-    async fn run_ingest_thread(&self, run_id: &str, root: &PostId) -> Result<u64> {
-        let mut seen: HashSet<PostId> = HashSet::new();
-        let mut batch = Vec::new();
-        let mut total: u64 = 0;
-
-        // Use the provider's `fetch_thread` which returns root + all
-        // descendants via the manifest's `post/conversation` edge. Previously
-        // this method only called `fetch_replies`, silently dropping the root
-        // when it wasn't already in the store and storing ZERO posts for a
-        // thread with no replies while still reporting success.
-        info!(root = %root, "fetching conversation");
-        let posts = self.provider.fetch_thread(root).await?;
-        for post in posts {
-            if seen.insert(post.id.clone()) {
-                batch.push(post);
-            }
-            if batch.len() >= BATCH_SIZE {
-                let written = self.store.upsert_posts(&batch, Some(run_id))?;
-                total += written as u64;
-                batch.clear();
-            }
-        }
-
-        // Flush remaining.
-        if !batch.is_empty() {
-            let written = self.store.upsert_posts(&batch, Some(run_id))?;
-            total += written as u64;
-        }
-
-        Ok(total)
     }
 }

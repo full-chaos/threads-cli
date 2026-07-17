@@ -6,7 +6,7 @@
 //! `StoreWrite for threads_store::Store` and wire the two crates together.
 
 use chrono::{DateTime, Utc};
-use threads_core::{FetchRun, Post, PostId, Result, User, UserId};
+use threads_core::{AudienceSnapshot, FetchRun, Post, PostId, Result, User, UserId};
 
 /// Write interface required by the ingestion orchestrator.
 ///
@@ -16,6 +16,27 @@ pub trait StoreWrite: Send + Sync {
     /// Upsert a batch of posts, tagging each with `fetch_run_id` when provided.
     /// Returns the number of rows actually written/updated.
     fn upsert_posts(&self, posts: &[Post], fetch_run_id: Option<&str>) -> Result<usize>;
+
+    /// Upsert one complete, transactionally persisted audience observation.
+    fn upsert_audience_snapshot(
+        &self,
+        snapshot: &AudienceSnapshot,
+        fetch_run_id: Option<&str>,
+    ) -> Result<()>;
+
+    fn audience_history(&self, account_id: &UserId, limit: usize) -> Result<Vec<AudienceSnapshot>>;
+
+    fn count_audience_snapshots_before(
+        &self,
+        account_id: &UserId,
+        before: DateTime<Utc>,
+    ) -> Result<u64>;
+
+    fn delete_audience_snapshots_before(
+        &self,
+        account_id: &UserId,
+        before: DateTime<Utc>,
+    ) -> Result<u64>;
 
     /// Record that a fetch run has started (insert the initial row).
     fn record_fetch_run_start(&self, run: &FetchRun) -> Result<()>;
@@ -47,6 +68,34 @@ pub trait StoreWrite: Send + Sync {
 impl StoreWrite for threads_store::Store {
     fn upsert_posts(&self, posts: &[Post], fetch_run_id: Option<&str>) -> Result<usize> {
         Self::upsert_posts(self, posts, fetch_run_id).map_err(Into::into)
+    }
+
+    fn upsert_audience_snapshot(
+        &self,
+        snapshot: &AudienceSnapshot,
+        fetch_run_id: Option<&str>,
+    ) -> Result<()> {
+        Self::upsert_audience_snapshot(self, snapshot, fetch_run_id).map_err(Into::into)
+    }
+
+    fn audience_history(&self, account_id: &UserId, limit: usize) -> Result<Vec<AudienceSnapshot>> {
+        Self::audience_history(self, account_id, limit).map_err(Into::into)
+    }
+
+    fn count_audience_snapshots_before(
+        &self,
+        account_id: &UserId,
+        before: DateTime<Utc>,
+    ) -> Result<u64> {
+        Self::count_audience_snapshots_before(self, account_id, before).map_err(Into::into)
+    }
+
+    fn delete_audience_snapshots_before(
+        &self,
+        account_id: &UserId,
+        before: DateTime<Utc>,
+    ) -> Result<u64> {
+        Self::delete_audience_snapshots_before(self, account_id, before).map_err(Into::into)
     }
 
     fn record_fetch_run_start(&self, run: &FetchRun) -> Result<()> {

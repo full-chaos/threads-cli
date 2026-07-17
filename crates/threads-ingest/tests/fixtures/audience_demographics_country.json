@@ -1,0 +1,21 @@
+{
+  "data": [
+    {
+      "name": "follower_demographics",
+      "period": "lifetime",
+      "total_value": {
+      "breakdowns": [
+        {
+          "dimension_keys": ["country"],
+          "results": [
+            { "dimension_values": ["US"], "value": 800 },
+            { "dimension_values": ["CA"], "value": 434 }
+          ]
+        }
+      ]},
+      "title": "Follower demographics",
+      "description": "Follower demographics grouped by country.",
+      "id": "17841400000000000/insights/follower_demographics/lifetime"
+    }
+  ]
+}

@@ -1,11 +1,12 @@
 #[cfg(test)]
 #[allow(clippy::module_inception)]
 mod tests {
-    use chrono::Utc;
+    use chrono::{Duration, Utc};
     use rusqlite::params;
     use serde_json::json;
     use threads_core::model::{
-        FetchRun, Media, MediaKind, Mention, Post, PostId, UrlEntity, User, UserId,
+        AudienceSnapshot, DemographicBucket, DemographicDimension, EngagementSort, FetchRun, Media,
+        MediaKind, Mention, Post, PostId, UrlEntity, User, UserId,
     };
 
     use crate::{PostKind, Store};
@@ -24,6 +25,7 @@ mod tests {
         Post {
             id: PostId::new(id),
             author: UserId::new(author),
+            author_username: None,
             text: Some(format!("hello from post {id}")),
             created_at: Some(Utc::now()),
             parent_id: None,
@@ -46,6 +48,40 @@ mod tests {
 
     fn ids(posts: &[Post]) -> Vec<&str> {
         posts.iter().map(|p| p.id.as_str()).collect()
+    }
+
+    fn audience_snapshot(
+        account_id: &str,
+        observed_at: chrono::DateTime<Utc>,
+        followers: u64,
+    ) -> AudienceSnapshot {
+        AudienceSnapshot {
+            account_id: UserId::new(account_id),
+            observed_at,
+            followers_count: followers,
+            demographics: vec![
+                DemographicBucket {
+                    dimension: DemographicDimension::Age,
+                    bucket: "25-34".into(),
+                    value: 40,
+                },
+                DemographicBucket {
+                    dimension: DemographicDimension::City,
+                    bucket: "New York".into(),
+                    value: 20,
+                },
+                DemographicBucket {
+                    dimension: DemographicDimension::Country,
+                    bucket: "US".into(),
+                    value: 60,
+                },
+                DemographicBucket {
+                    dimension: DemographicDimension::Gender,
+                    bucket: "female".into(),
+                    value: 55,
+                },
+            ],
+        }
     }
 
     // ------------------------------------------------------------------ //
@@ -95,6 +131,329 @@ mod tests {
         assert_eq!(index_count, 2);
     }
 
+    #[test]
+    fn migration_v4_creates_audience_tables_and_indexes() {
+        let store = Store::open_in_memory().unwrap();
+        let conn = store.raw_conn();
+
+        let table_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('audience_snapshots', 'audience_demographics')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(table_count, 2);
+
+        let index_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name IN ('audience_snapshots_account_observed_idx', 'audience_demographics_snapshot_idx')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(index_count, 2);
+    }
+
+    #[test]
+    fn audience_snapshot_upsert_replaces_same_time_in_one_transaction() {
+        let store = Store::open_in_memory().unwrap();
+        let observed_at = Utc::now();
+        let first = audience_snapshot("audience-a", observed_at, 100);
+        store.upsert_audience_snapshot(&first, None).unwrap();
+
+        let mut replacement = audience_snapshot("audience-a", observed_at, 80);
+        replacement.demographics[0].value = 45;
+        store.upsert_audience_snapshot(&replacement, None).unwrap();
+
+        let history = store
+            .audience_history(&UserId::new("audience-a"), 10)
+            .unwrap();
+        assert_eq!(history, vec![replacement]);
+    }
+
+    #[test]
+    fn audience_history_is_account_scoped_chronological_and_allows_decreases() {
+        let store = Store::open_in_memory().unwrap();
+        let now = Utc::now();
+        let oldest = audience_snapshot("audience-a", now - Duration::days(2), 100);
+        let newest = audience_snapshot("audience-a", now - Duration::days(1), 80);
+        let other_account = audience_snapshot("audience-b", now, 999);
+        store.upsert_audience_snapshot(&oldest, None).unwrap();
+        store.upsert_audience_snapshot(&newest, None).unwrap();
+        store
+            .upsert_audience_snapshot(&other_account, None)
+            .unwrap();
+
+        let history = store
+            .audience_history(&UserId::new("audience-a"), 2)
+            .unwrap();
+        assert_eq!(history, vec![oldest, newest]);
+    }
+
+    #[test]
+    fn audience_snapshot_rejects_duplicate_buckets_without_partial_write() {
+        let store = Store::open_in_memory().unwrap();
+        let now = Utc::now();
+        let mut invalid = audience_snapshot("audience-a", now, 100);
+        invalid.demographics.push(invalid.demographics[0].clone());
+
+        assert!(store.upsert_audience_snapshot(&invalid, None).is_err());
+        assert!(
+            store
+                .audience_history(&UserId::new("audience-a"), 10)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn audience_constraints_reject_negative_counts_and_cascade_demographics() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_user(&make_user("audience-a")).unwrap();
+        let conn = store.raw_conn();
+
+        assert!(conn
+            .execute(
+                "INSERT INTO audience_snapshots (account_id, observed_at, followers_count) VALUES ('audience-a', '2026-01-01T00:00:00+00:00', -1)",
+                [],
+            )
+            .is_err());
+
+        conn.execute(
+            "INSERT INTO audience_snapshots (account_id, observed_at, followers_count) VALUES ('audience-a', '2026-01-01T00:00:00+00:00', 1)",
+            [],
+        )
+        .unwrap();
+        let snapshot_id: i64 = conn
+            .query_row(
+                "SELECT id FROM audience_snapshots WHERE account_id = 'audience-a'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(conn
+            .execute(
+                "INSERT INTO audience_demographics (snapshot_id, dimension, bucket, value) VALUES (?1, 'country', 'US', -1)",
+                params![snapshot_id],
+            )
+            .is_err());
+        conn.execute(
+            "INSERT INTO audience_demographics (snapshot_id, dimension, bucket, value) VALUES (?1, 'country', 'US', 1)",
+            params![snapshot_id],
+        )
+        .unwrap();
+        conn.execute("DELETE FROM users WHERE id = 'audience-a'", [])
+            .unwrap();
+        let demographics_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM audience_demographics", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(demographics_count, 0);
+    }
+
+    #[test]
+    fn audience_count_and_delete_before_cutoff_are_account_scoped() {
+        let store = Store::open_in_memory().unwrap();
+        let now = Utc::now();
+        let stale = audience_snapshot("audience-a", now - Duration::days(2), 100);
+        let fresh = audience_snapshot("audience-a", now - Duration::hours(1), 110);
+        let other = audience_snapshot("audience-b", now - Duration::days(2), 200);
+        store.upsert_audience_snapshot(&stale, None).unwrap();
+        store.upsert_audience_snapshot(&fresh, None).unwrap();
+        store.upsert_audience_snapshot(&other, None).unwrap();
+
+        let cutoff = now - Duration::days(1);
+        assert_eq!(
+            store
+                .count_audience_snapshots_before(&UserId::new("audience-a"), cutoff)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .delete_audience_snapshots_before(&UserId::new("audience-a"), cutoff)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .audience_history(&UserId::new("audience-a"), 10)
+                .unwrap(),
+            vec![fresh]
+        );
+        assert_eq!(
+            store
+                .audience_history(&UserId::new("audience-b"), 10)
+                .unwrap(),
+            vec![other]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_store_creates_private_parent_and_database() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("private").join("threads.sqlite");
+        let store = Store::open(&path).unwrap();
+        store
+            .upsert_audience_snapshot(&audience_snapshot("audience-a", Utc::now(), 1), None)
+            .unwrap();
+
+        assert_eq!(
+            std::fs::metadata(path.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let wal = path.with_file_name("threads.sqlite-wal");
+        let shm = path.with_file_name("threads.sqlite-shm");
+        assert_eq!(
+            std::fs::metadata(wal).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(shm).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_store_preserves_existing_custom_parent_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().join("custom-parent");
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let path = parent.join("threads.sqlite");
+        Store::open(&path).unwrap();
+
+        assert_eq!(
+            std::fs::metadata(parent).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_rejects_symlinked_database_target() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let victim = temp.path().join("victim.sqlite");
+        std::fs::write(&victim, b"original database bytes").unwrap();
+        let path = temp.path().join("threads.sqlite");
+        symlink(&victim, &path).unwrap();
+
+        let error = match Store::open(&path) {
+            Err(error) => error,
+            Ok(_) => panic!("symlinked database target must be rejected"),
+        };
+
+        assert!(matches!(error, crate::StoreError::Io(_)));
+        assert_eq!(std::fs::read(&victim).unwrap(), b"original database bytes");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_rejects_existing_symlink_without_chmodding_victim() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let temp = tempfile::tempdir().unwrap();
+        let victim = temp.path().join("victim.sqlite");
+        std::fs::write(&victim, b"original database bytes").unwrap();
+        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let path = temp.path().join("threads.sqlite");
+        symlink(&victim, &path).unwrap();
+
+        assert!(Store::open(&path).is_err());
+        assert_eq!(
+            std::fs::metadata(victim).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_rejects_existing_symlinked_sqlite_sidecars() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("threads.sqlite");
+        std::fs::write(&path, []).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let victim = temp.path().join("victim.sqlite");
+        std::fs::write(&victim, b"untouched").unwrap();
+        let wal = path.with_file_name("threads.sqlite-wal");
+        symlink(&victim, &wal).unwrap();
+
+        assert!(Store::open(&path).is_err());
+        assert_eq!(std::fs::read(victim).unwrap(), b"untouched");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_rejects_group_writable_existing_parent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().join("shared");
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o770)).unwrap();
+
+        assert!(Store::open(parent.join("threads.sqlite")).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_creates_database_with_mode_0600() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("threads.sqlite");
+
+        Store::open(&path).unwrap();
+
+        assert_eq!(
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_creates_private_wal_sidecars() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("threads.sqlite");
+        let store = Store::open(&path).unwrap();
+
+        let wal = path.with_file_name("threads.sqlite-wal");
+        let shm = path.with_file_name("threads.sqlite-shm");
+        assert_eq!(
+            std::fs::metadata(wal).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(shm).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        drop(store);
+    }
+
     // ------------------------------------------------------------------ //
     //  Upsert idempotency                                                 //
     // ------------------------------------------------------------------ //
@@ -131,6 +490,20 @@ mod tests {
             fetched.unwrap().text.as_deref(),
             Some("hello from post p42")
         );
+    }
+
+    #[test]
+    fn post_roundtrip_reconstructs_author_username_from_user() {
+        let store = Store::open_in_memory().unwrap();
+        let mut post = make_post("p-author-username", "u-author-username");
+        post.author_username = Some("alice".into());
+        store.upsert_post(&post, None).unwrap();
+
+        let fetched = store
+            .get_post(&PostId::new("p-author-username"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(fetched.author_username.as_deref(), Some("alice"));
     }
 
     // ------------------------------------------------------------------ //
@@ -181,6 +554,7 @@ mod tests {
         let root = Post {
             id: PostId::new("root"),
             author: UserId::new("u1"),
+            author_username: None,
             text: Some("root post".into()),
             created_at: Some(now),
             parent_id: None,
@@ -196,6 +570,7 @@ mod tests {
         let reply1 = Post {
             id: PostId::new("reply1"),
             author: UserId::new("u2"),
+            author_username: None,
             text: Some("reply 1".into()),
             created_at: Some(now + chrono::Duration::seconds(1)),
             parent_id: Some(PostId::new("root")),
@@ -211,6 +586,7 @@ mod tests {
         let reply2 = Post {
             id: PostId::new("reply2"),
             author: UserId::new("u3"),
+            author_username: None,
             text: Some("reply 2".into()),
             created_at: Some(now + chrono::Duration::seconds(2)),
             parent_id: Some(PostId::new("root")),
@@ -226,6 +602,7 @@ mod tests {
         let reply1_1 = Post {
             id: PostId::new("reply1_1"),
             author: UserId::new("u4"),
+            author_username: None,
             text: Some("reply to reply 1".into()),
             created_at: Some(now + chrono::Duration::seconds(3)),
             parent_id: Some(PostId::new("reply1")),
@@ -271,6 +648,7 @@ mod tests {
         let post = Post {
             id: PostId::new("m_post"),
             author: UserId::new("author1"),
+            author_username: None,
             text: Some("hey @someuser".into()),
             created_at: Some(Utc::now()),
             parent_id: None,
@@ -304,6 +682,7 @@ mod tests {
         let quote_post = Post {
             id: PostId::new("quote_post"),
             author: UserId::new("u_quoter"),
+            author_username: None,
             text: Some("quoting this".into()),
             created_at: Some(Utc::now()),
             parent_id: Some(PostId::new("original_post")),
@@ -341,6 +720,7 @@ mod tests {
         let post = Post {
             id: PostId::new("raw_p1"),
             author: UserId::new("raw_author"),
+            author_username: None,
             text: Some("raw payload test".into()),
             created_at: Some(Utc::now()),
             parent_id: None,
@@ -437,6 +817,7 @@ mod tests {
         let post = Post {
             id: PostId::new("media_post"),
             author: UserId::new("media_author"),
+            author_username: None,
             text: Some("post with media".into()),
             created_at: Some(Utc::now()),
             parent_id: None,
@@ -469,6 +850,25 @@ mod tests {
         assert_eq!(fetched.media.len(), 2);
         assert_eq!(fetched.urls.len(), 1);
         assert_eq!(fetched.urls[0].url, "https://threads.net");
+    }
+
+    #[test]
+    fn get_post_returns_error_for_corrupt_media_row() {
+        let store = Store::open_in_memory().unwrap();
+        let post = make_post("corrupt-media", "corrupt-author");
+        store.upsert_post(&post, None).unwrap();
+        let conn = store.raw_conn();
+        conn.execute(
+            "INSERT INTO media (post_id, kind, url, thumbnail_url) VALUES (?1, 'image', X'00', NULL)",
+            params!["corrupt-media"],
+        )
+        .unwrap();
+        drop(conn);
+
+        assert!(matches!(
+            store.get_post(&PostId::new("corrupt-media")),
+            Err(crate::StoreError::Sqlite(_))
+        ));
     }
 
     // ------------------------------------------------------------------ //
@@ -797,19 +1197,33 @@ mod tests {
     #[test]
     fn reupsert_via_sparse_reply_preserves_rich_root() {
         let store = Store::open_in_memory().unwrap();
+        let mut author = make_user("123456");
+        author.username = Some("alice".into());
+        store.upsert_user(&author).unwrap();
 
         // 1. Insert a rich root post: media, urls, mentions, permalink, real author, quote.
         let rich = Post {
             id: PostId::new("root_merge"),
             author: UserId::new("123456"),
+            author_username: Some("alice".into()),
             text: Some("rich post text".into()),
             created_at: Some(Utc::now()),
             parent_id: None,
             root_id: None,
             permalink: Some("https://threads.net/p/rich".into()),
-            media: vec![Media { kind: MediaKind::Image, url: Some("https://example.com/img.jpg".into()), thumbnail_url: None }],
-            urls: vec![UrlEntity { url: "https://threads.net".into(), display_text: Some("threads".into()) }],
-            mentions: vec![Mention { username: "bob".into(), user_id: None }],
+            media: vec![Media {
+                kind: MediaKind::Image,
+                url: Some("https://example.com/img.jpg".into()),
+                thumbnail_url: None,
+            }],
+            urls: vec![UrlEntity {
+                url: "https://threads.net".into(),
+                display_text: Some("threads".into()),
+            }],
+            mentions: vec![Mention {
+                username: "bob".into(),
+                user_id: None,
+            }],
             is_quote_post: true,
             raw: None,
         };
@@ -819,6 +1233,7 @@ mod tests {
         let sparse = Post {
             id: PostId::new("root_merge"),
             author: UserId::new("@alice"),
+            author_username: None,
             text: None,
             created_at: None,
             parent_id: None,
@@ -833,15 +1248,31 @@ mod tests {
         store.upsert_post(&sparse, None).unwrap();
 
         // 3. Assert the rich fields survived the sparse re-upsert.
-        let fetched = store.get_post(&PostId::new("root_merge")).unwrap().expect("post must exist");
-        assert_eq!(fetched.author, UserId::new("123456"), "real author must survive");
-        assert_eq!(fetched.text.as_deref(), Some("rich post text"), "text must survive");
+        let fetched = store
+            .get_post(&PostId::new("root_merge"))
+            .unwrap()
+            .expect("post must exist");
+        assert_eq!(
+            fetched.author,
+            UserId::new("123456"),
+            "real author must survive"
+        );
+        assert_eq!(
+            fetched.text.as_deref(),
+            Some("rich post text"),
+            "text must survive"
+        );
         assert!(fetched.created_at.is_some(), "created_at must survive");
-        assert_eq!(fetched.permalink.as_deref(), Some("https://threads.net/p/rich"), "permalink must survive");
+        assert_eq!(
+            fetched.permalink.as_deref(),
+            Some("https://threads.net/p/rich"),
+            "permalink must survive"
+        );
         assert_eq!(fetched.media.len(), 1, "media must survive");
         assert_eq!(fetched.urls.len(), 1, "urls must survive");
         assert_eq!(fetched.mentions.len(), 1, "mentions must survive");
         assert!(fetched.is_quote_post, "is_quote_post must stay true");
+        assert_eq!(fetched.author_username.as_deref(), Some("alice"));
     }
 
     // ------------------------------------------------------------------ //
@@ -854,22 +1285,49 @@ mod tests {
         let post = Post {
             id: PostId::new("post_under_handle"),
             author: UserId::new("@alice"),
+            author_username: Some("alice".into()),
             text: Some("written by alice".into()),
             created_at: Some(Utc::now()),
-            parent_id: None, root_id: None, permalink: None,
-            media: vec![], urls: vec![], mentions: vec![], is_quote_post: false, raw: None,
+            parent_id: None,
+            root_id: None,
+            permalink: None,
+            media: vec![],
+            urls: vec![],
+            mentions: vec![],
+            is_quote_post: false,
+            raw: None,
         };
         store.upsert_post(&post, None).unwrap();
 
-        store.resolve_author("alice", &UserId::new("99999")).unwrap();
+        store
+            .resolve_author("alice", &UserId::new("99999"))
+            .unwrap();
 
-        let fetched = store.get_post(&PostId::new("post_under_handle")).unwrap().expect("post must exist");
-        assert_eq!(fetched.author, UserId::new("99999"), "author must be rewritten to real id");
+        let fetched = store
+            .get_post(&PostId::new("post_under_handle"))
+            .unwrap()
+            .expect("post must exist");
+        assert_eq!(
+            fetched.author,
+            UserId::new("99999"),
+            "author must be rewritten to real id"
+        );
 
         let conn = store.raw_conn();
-        let placeholder_count: i64 = conn.query_row("SELECT COUNT(*) FROM users WHERE id = '@alice'", [], |r| r.get(0)).unwrap();
-        assert_eq!(placeholder_count, 0, "@alice placeholder user must be deleted");
-        let real_count: i64 = conn.query_row("SELECT COUNT(*) FROM users WHERE id = '99999'", [], |r| r.get(0)).unwrap();
+        let placeholder_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM users WHERE id = '@alice'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            placeholder_count, 0,
+            "@alice placeholder user must be deleted"
+        );
+        let real_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM users WHERE id = '99999'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
         assert_eq!(real_count, 1, "real user row must exist after resolution");
     }
 
@@ -879,18 +1337,385 @@ mod tests {
         let reply = Post {
             id: PostId::new("reply_under_handle"),
             author: UserId::new("@alice"),
+            author_username: Some("alice".into()),
             text: Some("my reply".into()),
             created_at: Some(Utc::now()),
             parent_id: Some(PostId::new("some_root")),
             root_id: Some(PostId::new("some_root")),
-            permalink: None, media: vec![], urls: vec![], mentions: vec![], is_quote_post: false, raw: None,
+            permalink: None,
+            media: vec![],
+            urls: vec![],
+            mentions: vec![],
+            is_quote_post: false,
+            raw: None,
         };
         store.upsert_post(&reply, None).unwrap();
 
-        assert!(store.posts_by_author(&UserId::new("99999")).unwrap().is_empty(), "no posts under real id before resolution");
-        store.resolve_author("alice", &UserId::new("99999")).unwrap();
+        assert!(
+            store
+                .posts_by_author(&UserId::new("99999"))
+                .unwrap()
+                .is_empty(),
+            "no posts under real id before resolution"
+        );
+        store
+            .resolve_author("alice", &UserId::new("99999"))
+            .unwrap();
         let after = store.posts_by_author(&UserId::new("99999")).unwrap();
-        assert_eq!(after.len(), 1, "reply must be found under real id after resolution");
+        assert_eq!(
+            after.len(),
+            1,
+            "reply must be found under real id after resolution"
+        );
         assert_eq!(after[0], PostId::new("reply_under_handle"));
+    }
+
+    #[test]
+    fn authoritative_post_upsert_reconciles_matching_handle_placeholder() {
+        // Given a post ingested before the provider knows Alice's real id.
+        let store = Store::open_in_memory().unwrap();
+        let mut placeholder = make_post("placeholder_post", "@alice");
+        placeholder.author_username = Some("alice".into());
+        store.upsert_post(&placeholder, None).unwrap();
+
+        // When an authoritative id/username pair arrives with another post.
+        let mut authoritative = make_post("authoritative_post", "alice-id");
+        authoritative.author_username = Some("alice".into());
+        store.upsert_post(&authoritative, None).unwrap();
+
+        // Then the matching placeholder is rewritten before the new post is stored.
+        assert_eq!(
+            store
+                .get_post(&PostId::new("placeholder_post"))
+                .unwrap()
+                .unwrap()
+                .author,
+            UserId::new("alice-id")
+        );
+        assert_eq!(
+            store
+                .posts_by_author(&UserId::new("alice-id"))
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn authoritative_username_changes_keep_real_ids_separate() {
+        // Given one real account changes its username and another real account
+        // later uses the former handle.
+        let store = Store::open_in_memory().unwrap();
+        let mut original = make_post("original", "first-id");
+        original.author_username = Some("shared-handle".into());
+        store.upsert_post(&original, None).unwrap();
+        let mut renamed = make_post("renamed", "first-id");
+        renamed.author_username = Some("first-new-name".into());
+        store.upsert_post(&renamed, None).unwrap();
+        let mut second = make_post("second", "second-id");
+        second.author_username = Some("shared-handle".into());
+
+        // When the second real id is persisted under the historical handle.
+        store.upsert_post(&second, None).unwrap();
+
+        // Then real ids are never merged based on display identity.
+        assert_eq!(
+            store
+                .get_post(&PostId::new("original"))
+                .unwrap()
+                .unwrap()
+                .author,
+            UserId::new("first-id")
+        );
+        assert_eq!(
+            store
+                .get_post(&PostId::new("second"))
+                .unwrap()
+                .unwrap()
+                .author,
+            UserId::new("second-id")
+        );
+    }
+
+    fn relationship_post(id: &str, author: &str) -> Post {
+        make_post(id, author)
+    }
+
+    #[test]
+    fn rank_engaged_accounts_counts_observed_relations_and_sorts_deterministically() {
+        // Given direct replies, nested replies, mention-only posts, dual-component
+        // posts, self activity, and alphabetical ties.
+        let store = Store::open_in_memory().unwrap();
+        let target = UserId::new("target");
+        let target_post = relationship_post("target-post", "target");
+        store.upsert_post(&target_post, None).unwrap();
+
+        for id in ["reply-one", "reply-two"] {
+            let mut post = relationship_post(id, "replier");
+            post.parent_id = Some(PostId::new("target-post"));
+            store.upsert_post(&post, None).unwrap();
+        }
+        let mut nested = relationship_post("nested", "nested-author");
+        nested.parent_id = Some(PostId::new("reply-one"));
+        store.upsert_post(&nested, None).unwrap();
+
+        for id in ["mention-one", "mention-two", "mention-three"] {
+            let mut post = relationship_post(id, "mentioner");
+            post.mentions = vec![Mention {
+                username: "target".into(),
+                user_id: Some(target.clone()),
+            }];
+            store.upsert_post(&post, None).unwrap();
+        }
+        let mut dual = relationship_post("dual", "dual-author");
+        dual.parent_id = Some(PostId::new("target-post"));
+        dual.mentions = vec![Mention {
+            username: "target".into(),
+            user_id: Some(target.clone()),
+        }];
+        store.upsert_post(&dual, None).unwrap();
+        let mut self_activity = relationship_post("self-activity", "target");
+        self_activity.parent_id = Some(PostId::new("target-post"));
+        self_activity.mentions = vec![Mention {
+            username: "target".into(),
+            user_id: Some(target.clone()),
+        }];
+        store.upsert_post(&self_activity, None).unwrap();
+        for (id, author, username) in [
+            ("alpha-mention", "alpha-id", "Alpha"),
+            ("beta-mention", "beta-id", "beta"),
+        ] {
+            let mut post = relationship_post(id, author);
+            post.author_username = Some(username.into());
+            post.mentions = vec![Mention {
+                username: "target".into(),
+                user_id: Some(target.clone()),
+            }];
+            store.upsert_post(&post, None).unwrap();
+        }
+
+        // When rankings are requested for each supported primary sort.
+        let total = store
+            .rank_engaged_accounts(&target, 10, EngagementSort::Total)
+            .unwrap();
+        let replies = store
+            .rank_engaged_accounts(&target, 10, EngagementSort::Replies)
+            .unwrap();
+        let mentions = store
+            .rank_engaged_accounts(&target, 10, EngagementSort::Mentions)
+            .unwrap();
+
+        // Then direct and mention components are independently distinct, self and
+        // nested activity are excluded, and ties use normalized display identity.
+        assert_eq!(
+            total
+                .iter()
+                .map(|account| account.user_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["mentioner", "dual-author", "replier", "alpha-id", "beta-id"]
+        );
+        assert_eq!(
+            total[1].replies, 1,
+            "the dual post contributes a direct reply"
+        );
+        assert_eq!(
+            total[1].mentions, 1,
+            "the dual post also contributes a mention"
+        );
+        assert_eq!(total[1].total, 2);
+        assert!(
+            total.iter().all(|account| account.user_id != target),
+            "self-authored activity is excluded"
+        );
+        assert!(
+            total
+                .iter()
+                .all(|account| account.user_id != UserId::new("nested-author")),
+            "a reply to another replier is not a direct reply to the target"
+        );
+        assert_eq!(
+            replies
+                .iter()
+                .map(|account| account.user_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["replier", "dual-author", "alpha-id", "beta-id", "mentioner"]
+        );
+        assert_eq!(
+            mentions
+                .iter()
+                .map(|account| account.user_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["mentioner", "alpha-id", "beta-id", "dual-author", "replier"]
+        );
+        assert_eq!(
+            store
+                .rank_engaged_accounts(&target, 2, EngagementSort::Total)
+                .unwrap()
+                .len(),
+            2,
+            "limit applies after deterministic ordering"
+        );
+    }
+
+    #[test]
+    fn rank_engaged_accounts_excludes_quote_activity_from_every_sort_and_limit() {
+        // Given a quote of the target's post that would otherwise be both a
+        // direct reply and an official mention from an absent author.
+        let store = Store::open_in_memory().unwrap();
+        let target = UserId::new("target");
+        let target_post = relationship_post("target-post", "target");
+        store.upsert_post(&target_post, None).unwrap();
+        let mut quote = relationship_post("quote-post", "quote-author");
+        quote.parent_id = Some(PostId::new("target-post"));
+        quote.mentions = vec![Mention {
+            username: "target".into(),
+            user_id: Some(target.clone()),
+        }];
+        quote.is_quote_post = true;
+        store.upsert_post(&quote, None).unwrap();
+
+        // When rankings are requested with every primary sort and a restrictive limit.
+        let rankings = [
+            EngagementSort::Total,
+            EngagementSort::Replies,
+            EngagementSort::Mentions,
+        ]
+        .into_iter()
+        .map(|sort| store.rank_engaged_accounts(&target, 1, sort).unwrap())
+        .collect::<Vec<_>>();
+
+        // Then quote activity cannot create an engaged account in any ranking.
+        assert!(rankings.iter().all(Vec::is_empty));
+    }
+
+    #[test]
+    fn rank_engaged_accounts_returns_empty_for_unobserved_account() {
+        // Given an account with no observed replies or targeted mentions.
+        let store = Store::open_in_memory().unwrap();
+
+        // When engagement is requested.
+        let ranked = store
+            .rank_engaged_accounts(&UserId::new("unobserved"), 10, EngagementSort::Total)
+            .unwrap();
+
+        // Then no inferred followers or quote-only activity appears.
+        assert!(ranked.is_empty());
+        assert!(
+            store
+                .rank_engaged_accounts(&UserId::new("unobserved"), 0, EngagementSort::Total)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .rank_engaged_accounts(
+                    &UserId::new("unobserved"),
+                    usize::MAX,
+                    EngagementSort::Total,
+                )
+                .is_err(),
+            "limits outside SQLite's signed range fail instead of wrapping"
+        );
+    }
+
+    #[test]
+    fn temp_db_qa_driver_prints_isolated_deterministic_rankings_and_cleans_up() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let database_path = temp_dir.path().join("t6-qa.sqlite");
+        let store = Store::open(&database_path).unwrap();
+        let target = UserId::new("qa-target");
+
+        let mut placeholder = relationship_post("qa-placeholder", "@shared");
+        placeholder.author_username = Some("shared".into());
+        store.upsert_post(&placeholder, None).unwrap();
+        let mut authoritative = relationship_post("qa-authoritative", "qa-first");
+        authoritative.author_username = Some("shared".into());
+        store.upsert_post(&authoritative, None).unwrap();
+        let mut historical_match = relationship_post("qa-second-real", "qa-second");
+        historical_match.author_username = Some("shared".into());
+        store.upsert_post(&historical_match, None).unwrap();
+
+        let target_post = relationship_post("qa-target-post", "qa-target");
+        store.upsert_post(&target_post, None).unwrap();
+        let mut direct_and_mentioned = relationship_post("qa-dual", "qa-first");
+        direct_and_mentioned.parent_id = Some(PostId::new("qa-target-post"));
+        direct_and_mentioned.mentions = vec![
+            Mention {
+                username: "qa-target".into(),
+                user_id: Some(target.clone()),
+            },
+            Mention {
+                username: "qa-target-duplicate".into(),
+                user_id: Some(target.clone()),
+            },
+        ];
+        store.upsert_post(&direct_and_mentioned, None).unwrap();
+        let mut nested = relationship_post("qa-nested", "qa-second");
+        nested.parent_id = Some(PostId::new("qa-dual"));
+        store.upsert_post(&nested, None).unwrap();
+        let mut mention_only = relationship_post("qa-mention-only", "qa-second");
+        mention_only.mentions = vec![Mention {
+            username: "qa-target".into(),
+            user_id: Some(target.clone()),
+        }];
+        store.upsert_post(&mention_only, None).unwrap();
+        let mut other_account_activity = relationship_post("qa-other-mention", "qa-other");
+        other_account_activity.mentions = vec![Mention {
+            username: "not-target".into(),
+            user_id: Some(UserId::new("other-target")),
+        }];
+        store.upsert_post(&other_account_activity, None).unwrap();
+
+        let render = |sort| {
+            store
+                .rank_engaged_accounts(&target, 10, sort)
+                .unwrap()
+                .into_iter()
+                .map(|account| {
+                    format!(
+                        "{}:{}:{}:{}",
+                        account.user_id, account.replies, account.mentions, account.total
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let total = render(EngagementSort::Total);
+        let replies = render(EngagementSort::Replies);
+        let mentions = render(EngagementSort::Mentions);
+        println!("T6_TEMP_DB_QA total={total:?}");
+        println!("T6_TEMP_DB_QA replies={replies:?}");
+        println!("T6_TEMP_DB_QA mentions={mentions:?}");
+        assert_eq!(total, vec!["qa-first:1:1:2", "qa-second:0:1:1"]);
+        assert_eq!(replies, vec!["qa-first:1:1:2", "qa-second:0:1:1"]);
+        assert_eq!(mentions, vec!["qa-first:1:1:2", "qa-second:0:1:1"]);
+        assert!(
+            store
+                .rank_engaged_accounts(&UserId::new("other-target"), 10, EngagementSort::Total)
+                .unwrap()
+                .iter()
+                .any(|account| account.user_id == UserId::new("qa-other")),
+            "account-scoped mentions remain isolated"
+        );
+        assert_eq!(
+            store
+                .get_post(&PostId::new("qa-placeholder"))
+                .unwrap()
+                .unwrap()
+                .author,
+            UserId::new("qa-first"),
+            "only the placeholder reconciles to the authoritative id"
+        );
+        assert_eq!(
+            store
+                .get_post(&PostId::new("qa-second-real"))
+                .unwrap()
+                .unwrap()
+                .author,
+            UserId::new("qa-second"),
+            "a matching historical username never merges real ids"
+        );
+        drop(store);
+        drop(temp_dir);
+        assert!(!database_path.exists(), "temporary QA database is removed");
     }
 }

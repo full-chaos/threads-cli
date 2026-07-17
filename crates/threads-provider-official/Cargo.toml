@@ -6,6 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 description = "Official Threads Graph API (graph.threads.net) provider for threads-cli"
 
+[features]
+test-support = []
+
 [dependencies]
 threads-core.workspace = true
 threads-manifest.workspace = true
@@ -22,6 +25,7 @@ tracing.workspace = true
 url.workspace = true
 keyring.workspace = true
 dirs.workspace = true
+libc.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
