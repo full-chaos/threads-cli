@@ -7,12 +7,13 @@ use chrono::{DateTime, Utc};
 use serde_json::json;
 use threads_core::{
     AudienceInsightQuery, AudienceInsightResult, AudienceSnapshot, Cursor, DemographicBucket,
-    DemographicDimension, DemographicInsight, Error, FetchRun, Mention, Page, Post, PostId, Result,
-    User, UserId,
+    DemographicDimension, DemographicInsight, EngagementSort, Error, FetchRun, Mention, Page, Post,
+    PostId, Result, User, UserId,
 };
 use threads_ingest::{
     Ingestor, MentionIngestWarning, NormalizeError, Normalizer, OfficialNormalizer, StoreWrite,
 };
+use threads_store::Store;
 
 // ---------- Fixtures (loaded from files) ----------
 
@@ -1142,6 +1143,82 @@ async fn refresh_audience_deduplicates_mentions_and_stops_on_repeated_cursor() {
         state.upserted[0].mentions[0].user_id,
         Some(UserId::new("audience-account"))
     );
+}
+
+#[tokio::test]
+async fn refresh_audience_is_idempotent_across_repeated_successes() {
+    // Given: identical successful responses and the real in-memory store.
+    let mut mention = MockProvider::make_post("mentioned-post", "another-user");
+    mention.mentions.push(Mention {
+        username: "audience_owner".into(),
+        user_id: Some(UserId::new("audience-account")),
+    });
+    let provider = Arc::new(
+        MockProvider::new(vec![])
+            .with_me(audience_account())
+            .with_audience(audience_with_all_breakdowns(100))
+            .with_mentions(Page::new(vec![mention], None)),
+    );
+    let store = Arc::new(Store::open_in_memory().expect("in-memory store should open"));
+    let ingestor = Ingestor::new(
+        Arc::clone(&provider),
+        Box::new(NoopNormalizer),
+        Arc::clone(&store),
+    );
+
+    // When: the same audience refresh succeeds twice.
+    let first = ingestor
+        .refresh_audience()
+        .await
+        .expect("first audience refresh should succeed");
+    let second = ingestor
+        .refresh_audience()
+        .await
+        .expect("second audience refresh should succeed");
+
+    // Then: observations are historical, while logical account and mention data stay singular.
+    assert_eq!(first.account_id, UserId::new("audience-account"));
+    assert_eq!(first.account_id, second.account_id);
+    assert_eq!(first.followers_count, second.followers_count);
+    assert_eq!(first.demographics_count, second.demographics_count);
+    assert_eq!(first.mentions_ingested, second.mentions_ingested);
+    assert_eq!(first.mention_warning, second.mention_warning);
+
+    let history = store
+        .audience_history(&UserId::new("audience-account"), 10)
+        .expect("audience history should be readable");
+    assert_eq!(history.len(), 2);
+    assert_ne!(history[0].observed_at, history[1].observed_at);
+    assert_eq!(history[0].account_id, UserId::new("audience-account"));
+    assert_eq!(history[1].account_id, UserId::new("audience-account"));
+    assert_eq!(history[0].followers_count, history[1].followers_count);
+    assert_eq!(history[0].demographics, history[1].demographics);
+
+    let posts = store
+        .list_posts(10)
+        .expect("mentioned posts should be readable");
+    assert_eq!(posts.len(), 1);
+    assert_eq!(posts[0].id, PostId::new("mentioned-post"));
+    assert_eq!(posts[0].author, UserId::new("another-user"));
+    assert_eq!(posts[0].mentions.len(), 1);
+    assert_eq!(
+        posts[0].mentions[0],
+        Mention {
+            username: "audience_owner".into(),
+            user_id: Some(UserId::new("audience-account")),
+        }
+    );
+
+    let engaged = store
+        .rank_engaged_accounts(
+            &UserId::new("audience-account"),
+            10,
+            EngagementSort::Mentions,
+        )
+        .expect("mention edge should be readable");
+    assert_eq!(engaged.len(), 1);
+    assert_eq!(engaged[0].user_id, UserId::new("another-user"));
+    assert_eq!(engaged[0].mentions, 1);
 }
 
 #[tokio::test]
