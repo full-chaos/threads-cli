@@ -22,6 +22,7 @@ chrono.workspace = true
 clap.workspace = true
 csv.workspace = true
 dirs.workspace = true
+libc = "0.2"
 open.workspace = true
 rand = { version = "0.10", default-features = false, features = ["std", "std_rng", "sys_rng"] }
 serde.workspace = true

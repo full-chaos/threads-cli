@@ -65,6 +65,7 @@ keyring = { version = "3", default-features = false, features = [
   "sync-secret-service",
 ] }
 dirs = "5"
+libc = "0.2"
 
 # test helpers
 tempfile = "3"

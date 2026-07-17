@@ -1,10 +1,9 @@
 use std::{
-    fs,
     io::{self, Write as _},
     path::Path,
 };
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow};
 use rand::{TryRng, rngs::SysRng};
 use threads_provider_official::{
     auth::{self, CallbackServer, DEFAULT_SCOPES},
@@ -125,26 +124,18 @@ async fn login_manual_paste(
         provider_cfg.redirect_uri
     );
     println!(
-        "3. Copy the resulting URL (or just the `code=...` parameter) from the browser's\n\
-         address bar and paste it here. (State to match: {state})\n"
+        "3. Copy the full resulting redirect URL from the browser address bar and paste it here.\n"
     );
 
     if let Err(error) = super::browser::open(url.as_str()) {
         eprintln!("could not open browser ({error}); visit the URL above manually");
     }
 
-    print!("Paste URL or code: ");
+    print!("Paste redirect URL: ");
     io::stdout().flush()?;
     let mut input = String::new();
     io::stdin().read_line(&mut input)?;
-    let (code, returned_state) = parse_code_from_input(input.trim())?;
-    if let Some(rs) = returned_state {
-        if rs != state {
-            return Err(anyhow!(
-                "OAuth state mismatch: got {rs:?}, expected {state:?} — aborting"
-            ));
-        }
-    }
+    let code = parse_code_from_input(input.trim(), state)?;
     finish_login(provider_cfg, &code).await
 }
 
@@ -175,26 +166,25 @@ async fn finish_login(provider_cfg: &threads_provider_official::Config, code: &s
     Ok(())
 }
 
-/// Accept either a bare code (`AQxxxxx...`) or a full URL with
-/// `?code=...&state=...` query params. Returns `(code, Option<state>)`.
-fn parse_code_from_input(input: &str) -> Result<(String, Option<String>)> {
-    if let Ok(url) = url::Url::parse(input) {
-        let mut code = None;
-        let mut state = None;
-        for (k, v) in url.query_pairs() {
-            if k == "code" {
-                code = Some(v.into_owned());
-            } else if k == "state" {
-                state = Some(v.into_owned());
-            }
+fn parse_code_from_input(input: &str, expected_state: &str) -> Result<String> {
+    let url = url::Url::parse(input).map_err(|_| anyhow!("paste the full redirect URL"))?;
+    let mut code = None;
+    let mut state = None;
+    for (key, value) in url.query_pairs() {
+        match key.as_ref() {
+            "code" => code = Some(value.into_owned()),
+            "state" => state = Some(value.into_owned()),
+            _ => {}
         }
-        let code = code.ok_or_else(|| anyhow!("URL has no `code=...` parameter"))?;
-        return Ok((code, state));
     }
-    if input.is_empty() {
-        return Err(anyhow!("empty input"));
+    let code = code.ok_or_else(|| anyhow!("URL has no `code=...` parameter"))?;
+    let state = state.ok_or_else(|| anyhow!("URL has no `state=...` parameter"))?;
+    if state != expected_state {
+        return Err(anyhow!(
+            "OAuth state mismatch: got {state:?}, expected {expected_state:?} — aborting"
+        ));
     }
-    Ok((input.to_string(), None))
+    Ok(code)
 }
 
 fn status() -> Result<()> {
@@ -229,10 +219,6 @@ fn logout() -> Result<()> {
     TokenStore::new()
         .clear()
         .map_err(|e| anyhow!("clear token: {e}"))?;
-    let path = CliConfig::token_path();
-    if path.exists() {
-        fs::remove_file(&path).context("removing token file")?;
-    }
     println!("token cleared");
     Ok(())
 }
@@ -267,27 +253,40 @@ mod tests {
 
     #[test]
     fn parses_full_redirect_url() {
-        let (code, state) =
-            parse_code_from_input("https://example.com/cb?code=AQx123&state=abc&extra=1").unwrap();
+        let code = parse_code_from_input(
+            "https://example.com/cb?code=AQx123&state=abc&extra=1",
+            "abc",
+        )
+        .unwrap();
         assert_eq!(code, "AQx123");
-        assert_eq!(state.as_deref(), Some("abc"));
     }
 
     #[test]
-    fn parses_bare_code() {
-        let (code, state) = parse_code_from_input("AQx123").unwrap();
-        assert_eq!(code, "AQx123");
-        assert!(state.is_none());
+    fn rejects_bare_code() {
+        assert!(parse_code_from_input("AQx123", "state").is_err());
     }
 
     #[test]
     fn rejects_empty_input() {
-        assert!(parse_code_from_input("").is_err());
+        assert!(parse_code_from_input("", "state").is_err());
     }
 
     #[test]
     fn rejects_url_without_code() {
-        assert!(parse_code_from_input("https://example.com/cb?foo=bar").is_err());
+        assert!(parse_code_from_input("https://example.com/cb?foo=bar", "state").is_err());
+    }
+
+    #[test]
+    fn rejects_redirect_without_state() {
+        assert!(parse_code_from_input("https://example.com/cb?code=AQx123", "state").is_err());
+    }
+
+    #[test]
+    fn rejects_redirect_with_a_mismatched_state() {
+        assert!(
+            parse_code_from_input("https://example.com/cb?code=AQx123&state=wrong", "state")
+                .is_err()
+        );
     }
 
     #[test]
