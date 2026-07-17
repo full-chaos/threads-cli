@@ -83,9 +83,6 @@ pub fn open_store(cfg: &CliConfig, cli_override: Option<&std::path::Path>) -> Re
     let path = cli_override
         .map(std::path::Path::to_path_buf)
         .unwrap_or_else(|| cfg.db_path());
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).context("creating DB parent dir")?;
-    }
     let store = Store::open(&path).map_err(|e| anyhow!("open store at {}: {e}", path.display()))?;
     Ok(Arc::new(store))
 }

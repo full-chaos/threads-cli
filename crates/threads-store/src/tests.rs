@@ -327,6 +327,133 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn file_store_preserves_existing_custom_parent_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().join("custom-parent");
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let path = parent.join("threads.sqlite");
+        Store::open(&path).unwrap();
+
+        assert_eq!(
+            std::fs::metadata(parent).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_rejects_symlinked_database_target() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let victim = temp.path().join("victim.sqlite");
+        std::fs::write(&victim, b"original database bytes").unwrap();
+        let path = temp.path().join("threads.sqlite");
+        symlink(&victim, &path).unwrap();
+
+        let error = match Store::open(&path) {
+            Err(error) => error,
+            Ok(_) => panic!("symlinked database target must be rejected"),
+        };
+
+        assert!(matches!(error, crate::StoreError::Io(_)));
+        assert_eq!(std::fs::read(&victim).unwrap(), b"original database bytes");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_rejects_existing_symlink_without_chmodding_victim() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let temp = tempfile::tempdir().unwrap();
+        let victim = temp.path().join("victim.sqlite");
+        std::fs::write(&victim, b"original database bytes").unwrap();
+        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let path = temp.path().join("threads.sqlite");
+        symlink(&victim, &path).unwrap();
+
+        assert!(Store::open(&path).is_err());
+        assert_eq!(
+            std::fs::metadata(victim).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_rejects_existing_symlinked_sqlite_sidecars() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("threads.sqlite");
+        std::fs::write(&path, []).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let victim = temp.path().join("victim.sqlite");
+        std::fs::write(&victim, b"untouched").unwrap();
+        let wal = path.with_file_name("threads.sqlite-wal");
+        symlink(&victim, &wal).unwrap();
+
+        assert!(Store::open(&path).is_err());
+        assert_eq!(std::fs::read(victim).unwrap(), b"untouched");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_rejects_group_writable_existing_parent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().join("shared");
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o770)).unwrap();
+
+        assert!(Store::open(parent.join("threads.sqlite")).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_creates_database_with_mode_0600() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("threads.sqlite");
+
+        Store::open(&path).unwrap();
+
+        assert_eq!(
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_creates_private_wal_sidecars() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("threads.sqlite");
+        let store = Store::open(&path).unwrap();
+
+        let wal = path.with_file_name("threads.sqlite-wal");
+        let shm = path.with_file_name("threads.sqlite-shm");
+        assert_eq!(
+            std::fs::metadata(wal).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(shm).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        drop(store);
+    }
+
     // ------------------------------------------------------------------ //
     //  Upsert idempotency                                                 //
     // ------------------------------------------------------------------ //
@@ -723,6 +850,25 @@ mod tests {
         assert_eq!(fetched.media.len(), 2);
         assert_eq!(fetched.urls.len(), 1);
         assert_eq!(fetched.urls[0].url, "https://threads.net");
+    }
+
+    #[test]
+    fn get_post_returns_error_for_corrupt_media_row() {
+        let store = Store::open_in_memory().unwrap();
+        let post = make_post("corrupt-media", "corrupt-author");
+        store.upsert_post(&post, None).unwrap();
+        let conn = store.raw_conn();
+        conn.execute(
+            "INSERT INTO media (post_id, kind, url, thumbnail_url) VALUES (?1, 'image', X'00', NULL)",
+            params!["corrupt-media"],
+        )
+        .unwrap();
+        drop(conn);
+
+        assert!(matches!(
+            store.get_post(&PostId::new("corrupt-media")),
+            Err(crate::StoreError::Sqlite(_))
+        ));
     }
 
     // ------------------------------------------------------------------ //

@@ -1,23 +1,20 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Mutex;
 
+use crate::error::{Result, StoreError};
+use crate::migrations::run_migrations;
+use crate::private_io::prepare_database_path;
+use crate::query;
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OpenFlags};
 use threads_core::model::{
     AudienceSnapshot, EngagedAccount, EngagementSort, FetchRun, Post, PostId, User, UserId,
 };
-#[cfg(unix)]
-use tracing::warn;
-
-use crate::error::{Result, StoreError};
-use crate::migrations::run_migrations;
-use crate::query;
 
 /// Thread-safe SQLite store.  The connection is wrapped in a `Mutex` so that
 /// `Store` can be `Send + Sync` while rusqlite's `Connection` is `!Send`.
 pub struct Store {
     conn: Mutex<Connection>,
-    database_path: Option<PathBuf>,
 }
 
 // Safety: `Mutex<Connection>` provides the needed mutual exclusion; we never
@@ -26,48 +23,20 @@ unsafe impl Send for Store {}
 unsafe impl Sync for Store {}
 
 impl Store {
-    fn prepare_parent(path: &Path) -> Result<()> {
-        let Some(parent) = path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-        else {
-            return Ok(());
-        };
-        std::fs::create_dir_all(parent)?;
-        #[cfg(unix)]
-        Self::set_private_mode(parent);
-        Ok(())
+    /// Open (or create) a store at `path`.
+    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
+        prepare_database_path(path.as_ref())?;
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
+        )
+        .map_err(StoreError::Sqlite)?;
+        Self::configure(&conn)?;
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
     }
 
-    #[cfg(unix)]
-    fn set_private_mode(path: &Path) {
-        use std::os::unix::fs::PermissionsExt;
-
-        if let Err(error) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)) {
-            warn!(path = %path.display(), %error, "could not secure store directory");
-        }
-    }
-
-    #[cfg(unix)]
-    fn secure_database_files(path: &Path) {
-        use std::os::unix::fs::PermissionsExt;
-
-        let mut wal = path.as_os_str().to_os_string();
-        wal.push("-wal");
-        let mut shm = path.as_os_str().to_os_string();
-        shm.push("-shm");
-        let paths = [path.to_path_buf(), wal.into(), shm.into()];
-        for file in paths {
-            if !file.exists() {
-                continue;
-            }
-            if let Err(error) =
-                std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600))
-            {
-                warn!(path = %file.display(), %error, "could not secure store database file");
-            }
-        }
-    }
     fn configure(conn: &Connection) -> Result<()> {
         conn.execute_batch(
             "PRAGMA foreign_keys = ON;
@@ -79,31 +48,12 @@ impl Store {
         Ok(())
     }
 
-    /// Open (or create) a store at `path`.
-    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let path = path.as_ref();
-        Self::prepare_parent(path)?;
-        let conn = Connection::open_with_flags(
-            path,
-            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
-        )
-        .map_err(StoreError::Sqlite)?;
-        Self::configure(&conn)?;
-        #[cfg(unix)]
-        Self::secure_database_files(path);
-        Ok(Self {
-            conn: Mutex::new(conn),
-            database_path: Some(path.to_path_buf()),
-        })
-    }
-
     /// Open an in-memory store (useful for testing).
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory().map_err(StoreError::Sqlite)?;
         Self::configure(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
-            database_path: None,
         })
     }
 
@@ -140,12 +90,7 @@ impl Store {
         fetch_run_id: Option<&str>,
     ) -> Result<()> {
         let mut conn = self.conn.lock().unwrap();
-        query::upsert_audience_snapshot(&mut conn, snapshot, fetch_run_id)?;
-        #[cfg(unix)]
-        if let Some(path) = &self.database_path {
-            Self::secure_database_files(path);
-        }
-        Ok(())
+        query::upsert_audience_snapshot(&mut conn, snapshot, fetch_run_id)
     }
 
     pub fn audience_history(

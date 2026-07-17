@@ -9,6 +9,7 @@
 
 mod error;
 mod migrations;
+mod private_io;
 mod query;
 mod store;
 #[cfg(test)]
