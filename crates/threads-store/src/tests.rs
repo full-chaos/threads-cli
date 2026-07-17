@@ -349,11 +349,12 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn open_rejects_symlinked_database_target() {
-        use std::os::unix::fs::symlink;
+        use std::os::unix::fs::{PermissionsExt, symlink};
 
         let temp = tempfile::tempdir().unwrap();
         let victim = temp.path().join("victim.sqlite");
         std::fs::write(&victim, b"original database bytes").unwrap();
+        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o644)).unwrap();
         let path = temp.path().join("threads.sqlite");
         symlink(&victim, &path).unwrap();
 
@@ -364,6 +365,10 @@ mod tests {
 
         assert!(matches!(error, crate::StoreError::Io(_)));
         assert_eq!(std::fs::read(&victim).unwrap(), b"original database bytes");
+        assert_eq!(
+            std::fs::metadata(victim).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
     }
 
     #[cfg(unix)]
@@ -394,13 +399,38 @@ mod tests {
         let path = temp.path().join("threads.sqlite");
         std::fs::write(&path, []).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        let victim = temp.path().join("victim.sqlite");
-        std::fs::write(&victim, b"untouched").unwrap();
+        let wal_victim = temp.path().join("wal-victim.sqlite");
+        let shm_victim = temp.path().join("shm-victim.sqlite");
+        std::fs::write(&wal_victim, b"wal untouched").unwrap();
+        std::fs::write(&shm_victim, b"shm untouched").unwrap();
+        std::fs::set_permissions(&wal_victim, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::set_permissions(&shm_victim, std::fs::Permissions::from_mode(0o644)).unwrap();
         let wal = path.with_file_name("threads.sqlite-wal");
-        symlink(&victim, &wal).unwrap();
+        symlink(&wal_victim, &wal).unwrap();
 
         assert!(Store::open(&path).is_err());
-        assert_eq!(std::fs::read(victim).unwrap(), b"untouched");
+        assert_eq!(std::fs::read(&wal_victim).unwrap(), b"wal untouched");
+        assert_eq!(
+            std::fs::metadata(&wal_victim).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+
+        std::fs::remove_file(wal).unwrap();
+        std::fs::write(path.with_file_name("threads.sqlite-wal"), []).unwrap();
+        std::fs::set_permissions(
+            path.with_file_name("threads.sqlite-wal"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        let shm = path.with_file_name("threads.sqlite-shm");
+        symlink(&shm_victim, &shm).unwrap();
+
+        assert!(Store::open(&path).is_err());
+        assert_eq!(std::fs::read(&shm_victim).unwrap(), b"shm untouched");
+        assert_eq!(
+            std::fs::metadata(shm_victim).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
     }
 
     #[cfg(unix)]
