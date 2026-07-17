@@ -3,7 +3,7 @@
     {
       "name": "follower_demographics",
       "period": "lifetime",
-      "total_value": 1234,
+      "total_value": {
       "breakdowns": [
         {
           "dimension_keys": ["gender"],
@@ -12,7 +12,7 @@
             { "dimension_values": ["M"], "value": 584 }
           ]
         }
-      ],
+      ]},
       "title": "Follower demographics",
       "description": "Follower demographics grouped by gender.",
       "id": "17841400000000000/insights/follower_demographics/lifetime"

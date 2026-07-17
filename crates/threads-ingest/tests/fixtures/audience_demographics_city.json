@@ -3,7 +3,7 @@
     {
       "name": "follower_demographics",
       "period": "lifetime",
-      "total_value": 1234,
+      "total_value": {
       "breakdowns": [
         {
           "dimension_keys": ["city"],
@@ -12,7 +12,7 @@
             { "dimension_values": ["Toronto"], "value": 300 }
           ]
         }
-      ],
+      ]},
       "title": "Follower demographics",
       "description": "Follower demographics grouped by city.",
       "id": "17841400000000000/insights/follower_demographics/lifetime"

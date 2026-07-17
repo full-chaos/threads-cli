@@ -3,7 +3,7 @@
     {
       "name": "follower_demographics",
       "period": "lifetime",
-      "total_value": 1234,
+      "total_value": {
       "breakdowns": [
         {
           "dimension_keys": ["country"],
@@ -12,7 +12,7 @@
             { "dimension_values": ["CA"], "value": 434 }
           ]
         }
-      ],
+      ]},
       "title": "Follower demographics",
       "description": "Follower demographics grouped by country.",
       "id": "17841400000000000/insights/follower_demographics/lifetime"

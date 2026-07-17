@@ -5,27 +5,20 @@
 //! paginates fully, deduplicates by `PostId`, and batch-upserts via
 //! `StoreWrite`.
 
-use std::{collections::HashSet, sync::Arc};
+use std::sync::Arc;
 
 use chrono::Utc;
-use threads_core::{
-    AudienceInsightQuery, AudienceInsightResult, AudienceSnapshot, Cursor, DemographicBucket,
-    DemographicDimension, Error, FetchRun, Mention, PostId, Provider, Result, User, UserId,
-};
-use tracing::info;
+use threads_core::{FetchRun, PostId, Provider, Result, UserId};
 use uuid::Uuid;
 
 use crate::{normalizer::Normalizer, store_shim::StoreWrite};
 
 /// Maximum posts to upsert in a single `StoreWrite::upsert_posts` call.
 const BATCH_SIZE: usize = 100;
-const MENTION_PAGE_SIZE: usize = 100;
-const DEMOGRAPHIC_DIMENSIONS: [DemographicDimension; 4] = [
-    DemographicDimension::Country,
-    DemographicDimension::City,
-    DemographicDimension::Age,
-    DemographicDimension::Gender,
-];
+
+mod audience_refresh;
+mod base_ingest;
+mod engagement;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MentionIngestWarning {
@@ -69,44 +62,9 @@ impl<P: Provider + 'static, S: StoreWrite + 'static> Ingestor<P, S> {
     /// 4. Batch-upserts 100 at a time.
     /// 5. Records the `FetchRun` in the store (start + end).
     pub async fn ingest_me(&self) -> Result<FetchRun> {
-        let run_id = Uuid::new_v4().to_string();
-        let provider_name = self.provider.name().to_string();
-        let started_at = Utc::now();
-
-        let run = FetchRun {
-            id: run_id.clone(),
-            provider: provider_name,
-            started_at,
-            finished_at: None,
-            posts_fetched: 0,
-            error: None,
-        };
-        self.store.record_fetch_run_start(&run)?;
-
-        let result = self.run_ingest_me(&run_id).await;
-
-        match result {
-            Ok(count) => {
-                let finished_at = Utc::now();
-                self.store
-                    .record_fetch_run_end(&run_id, finished_at, count, None)?;
-                Ok(FetchRun {
-                    id: run_id,
-                    provider: run.provider,
-                    started_at,
-                    finished_at: Some(finished_at),
-                    posts_fetched: count,
-                    error: None,
-                })
-            }
-            Err(err) => {
-                let finished_at = Utc::now();
-                let err_str = err.to_string();
-                self.store
-                    .record_fetch_run_end(&run_id, finished_at, 0, Some(&err_str))?;
-                Err(err)
-            }
-        }
+        let run = self.start_fetch_run()?;
+        let result = self.run_ingest_me(&run.id).await;
+        self.finish_fetch_run(run, result)
     }
 
     /// Ingest replies to every post authored by the authenticated user,
@@ -120,388 +78,51 @@ impl<P: Provider + 'static, S: StoreWrite + 'static> Ingestor<P, S> {
     ///
     /// Requires a prior `ingest_me()` to populate the seed set.
     pub async fn ingest_engagement(&self, max_depth: u32) -> Result<FetchRun> {
-        let run_id = Uuid::new_v4().to_string();
-        let provider_name = self.provider.name().to_string();
-        let started_at = Utc::now();
-        let run = FetchRun {
-            id: run_id.clone(),
-            provider: provider_name,
-            started_at,
-            finished_at: None,
-            posts_fetched: 0,
-            error: None,
-        };
-        self.store.record_fetch_run_start(&run)?;
-
-        let result = self.run_ingest_engagement(&run_id, max_depth).await;
-        let finished_at = Utc::now();
-        match result {
-            Ok(count) => {
-                self.store
-                    .record_fetch_run_end(&run_id, finished_at, count, None)?;
-                Ok(FetchRun {
-                    id: run_id,
-                    provider: run.provider,
-                    started_at,
-                    finished_at: Some(finished_at),
-                    posts_fetched: count,
-                    error: None,
-                })
-            }
-            Err(err) => {
-                let err_str = err.to_string();
-                self.store
-                    .record_fetch_run_end(&run_id, finished_at, 0, Some(&err_str))?;
-                Err(err)
-            }
-        }
+        let run = self.start_fetch_run()?;
+        let result = self.run_ingest_engagement(&run.id, max_depth).await;
+        self.finish_fetch_run(run, result)
     }
 
     /// Ingest a single thread (root post + all replies).
     ///
     /// Fetches replies for `root`, normalizing with the root's `PostId` as hint.
     pub async fn ingest_thread(&self, root: &PostId) -> Result<FetchRun> {
-        let run_id = Uuid::new_v4().to_string();
-        let provider_name = self.provider.name().to_string();
-        let started_at = Utc::now();
+        let run = self.start_fetch_run()?;
+        let result = self.run_ingest_thread(&run.id, root).await;
+        self.finish_fetch_run(run, result)
+    }
 
+    fn start_fetch_run(&self) -> Result<FetchRun> {
         let run = FetchRun {
-            id: run_id.clone(),
-            provider: provider_name,
-            started_at,
+            id: Uuid::new_v4().to_string(),
+            provider: self.provider.name().to_string(),
+            started_at: Utc::now(),
             finished_at: None,
             posts_fetched: 0,
             error: None,
         };
         self.store.record_fetch_run_start(&run)?;
+        Ok(run)
+    }
 
-        let result = self.run_ingest_thread(&run_id, root).await;
-
+    fn finish_fetch_run(&self, run: FetchRun, result: Result<u64>) -> Result<FetchRun> {
+        let finished_at = Utc::now();
         match result {
-            Ok(count) => {
-                let finished_at = Utc::now();
+            Ok(posts_fetched) => {
                 self.store
-                    .record_fetch_run_end(&run_id, finished_at, count, None)?;
+                    .record_fetch_run_end(&run.id, finished_at, posts_fetched, None)?;
                 Ok(FetchRun {
-                    id: run_id,
-                    provider: run.provider,
-                    started_at,
                     finished_at: Some(finished_at),
-                    posts_fetched: count,
-                    error: None,
+                    posts_fetched,
+                    ..run
                 })
             }
-            Err(err) => {
-                let finished_at = Utc::now();
-                let err_str = err.to_string();
+            Err(error) => {
+                let error_text = error.to_string();
                 self.store
-                    .record_fetch_run_end(&run_id, finished_at, 0, Some(&err_str))?;
-                Err(err)
+                    .record_fetch_run_end(&run.id, finished_at, 0, Some(&error_text))?;
+                Err(error)
             }
         }
-    }
-
-    pub async fn refresh_audience(&self) -> Result<AudienceRefreshSummary> {
-        self.refresh_audience_for_account(None).await
-    }
-
-    pub async fn refresh_audience_for_account(
-        &self,
-        expected_account_id: Option<&UserId>,
-    ) -> Result<AudienceRefreshSummary> {
-        let account = self.provider.fetch_me().await?;
-        if let Some(expected_account_id) = expected_account_id {
-            if account.id != *expected_account_id {
-                return Err(Error::Auth(format!(
-                    "stored token is bound to account {expected_account_id}, but Threads authenticated account is {}; run `threads-cli auth login`",
-                    account.id
-                )));
-            }
-        }
-        self.store.upsert_user(&account)?;
-        if let Some(username) = &account.username {
-            self.store.resolve_author(username, &account.id)?;
-        }
-
-        let followers_count = self.fetch_followers_count(&account.id).await?;
-        let demographics = self
-            .fetch_demographics(&account.id, followers_count)
-            .await?;
-        let snapshot = AudienceSnapshot {
-            account_id: account.id.clone(),
-            observed_at: Utc::now(),
-            followers_count,
-            demographics,
-        };
-        self.store.upsert_audience_snapshot(&snapshot, None)?;
-
-        let (mentions_ingested, mention_warning) = self.ingest_mentions(&account).await?;
-        Ok(AudienceRefreshSummary {
-            account_id: account.id,
-            followers_count,
-            demographics_count: snapshot.demographics.len(),
-            mentions_ingested,
-            mention_warning,
-        })
-    }
-
-    // --- private helpers ---
-
-    async fn run_ingest_me(&self, run_id: &str) -> Result<u64> {
-        // Persist the authenticated user's profile so the users table has
-        // username/name/bio (and so author resolution can run later).
-        let me = self.provider.fetch_me().await?;
-        self.store.upsert_user(&me)?;
-        if let Some(username) = &me.username {
-            self.store.resolve_author(username, &me.id)?;
-        }
-
-        let mut seen: HashSet<PostId> = HashSet::new();
-        let mut batch = Vec::new();
-        let mut total: u64 = 0;
-
-        // Phase 1 — own top-level threads.
-        let mut cursor: Option<Cursor> = None;
-        let mut page_num = 0usize;
-        loop {
-            page_num += 1;
-            info!(page = page_num, edge = "me/threads", "fetching page");
-            let page = self.provider.fetch_my_threads(cursor).await?;
-            let has_next = page.next.is_some();
-            for post in page.items {
-                if seen.insert(post.id.clone()) {
-                    batch.push(post);
-                }
-                if batch.len() >= BATCH_SIZE {
-                    let written = self.store.upsert_posts(&batch, Some(run_id))?;
-                    total += written as u64;
-                    batch.clear();
-                }
-            }
-            cursor = page.next;
-            if !has_next {
-                break;
-            }
-        }
-
-        // Phase 2 — own replies (replies I made to other posts).
-        let mut cursor: Option<Cursor> = None;
-        let mut page_num = 0usize;
-        loop {
-            page_num += 1;
-            info!(page = page_num, edge = "me/replies", "fetching page");
-            let page = self.provider.fetch_my_replies(cursor).await?;
-            let has_next = page.next.is_some();
-            for post in page.items {
-                if seen.insert(post.id.clone()) {
-                    batch.push(post);
-                }
-                if batch.len() >= BATCH_SIZE {
-                    let written = self.store.upsert_posts(&batch, Some(run_id))?;
-                    total += written as u64;
-                    batch.clear();
-                }
-            }
-            cursor = page.next;
-            if !has_next {
-                break;
-            }
-        }
-
-        // Flush remaining.
-        if !batch.is_empty() {
-            let written = self.store.upsert_posts(&batch, Some(run_id))?;
-            total += written as u64;
-        }
-
-        Ok(total)
-    }
-
-    async fn fetch_followers_count(&self, account_id: &UserId) -> Result<u64> {
-        match self
-            .provider
-            .fetch_audience_insight(account_id, AudienceInsightQuery::FollowersCount)
-            .await?
-        {
-            AudienceInsightResult::FollowersCount(value) => Ok(value),
-            AudienceInsightResult::Demographics(_) => Err(Error::Parse(
-                "followers_count request returned demographics".into(),
-            )),
-        }
-    }
-
-    async fn fetch_demographics(
-        &self,
-        account_id: &UserId,
-        followers_count: u64,
-    ) -> Result<Vec<DemographicBucket>> {
-        if followers_count < 100 {
-            return Ok(vec![]);
-        }
-
-        let mut demographics = Vec::new();
-        for dimension in DEMOGRAPHIC_DIMENSIONS {
-            match self
-                .provider
-                .fetch_audience_insight(
-                    account_id,
-                    AudienceInsightQuery::FollowerDemographics(dimension),
-                )
-                .await?
-            {
-                AudienceInsightResult::Demographics(snapshot) => {
-                    demographics.extend(snapshot.demographics);
-                }
-                AudienceInsightResult::FollowersCount(_) => {
-                    return Err(Error::Parse(format!(
-                        "{dimension:?} demographics request returned followers_count"
-                    )));
-                }
-            }
-        }
-        Ok(demographics)
-    }
-
-    async fn ingest_mentions(&self, account: &User) -> Result<(u64, Option<MentionIngestWarning>)> {
-        let Some(username) = account.username.as_deref() else {
-            return Ok((0, Some(MentionIngestWarning::MissingAuthenticatedUsername)));
-        };
-
-        let mention = Mention {
-            username: username.into(),
-            user_id: Some(account.id.clone()),
-        };
-        let mut seen_posts = HashSet::new();
-        let mut seen_cursors = HashSet::new();
-        let mut cursor = None;
-        let mut mentions_ingested = 0;
-
-        loop {
-            let page = match self
-                .provider
-                .fetch_mentions(&account.id, cursor, MENTION_PAGE_SIZE)
-                .await
-            {
-                Ok(page) => page,
-                Err(error) => return Ok((mentions_ingested, Some(Self::mention_warning(error)))),
-            };
-
-            let mut posts = Vec::new();
-            for mut post in page.items {
-                if seen_posts.insert(post.id.clone()) {
-                    if !post.mentions.iter().any(|existing| existing == &mention) {
-                        post.mentions.push(mention.clone());
-                    }
-                    posts.push(post);
-                }
-            }
-            if !posts.is_empty() {
-                mentions_ingested += self.store.upsert_posts(&posts, None)? as u64;
-            }
-
-            let Some(next) = page.next else {
-                return Ok((mentions_ingested, None));
-            };
-            if !seen_cursors.insert(next.0.clone()) {
-                return Ok((mentions_ingested, None));
-            }
-            cursor = Some(next);
-        }
-    }
-
-    fn mention_warning(error: Error) -> MentionIngestWarning {
-        match error {
-            Error::PermissionDenied(message) => MentionIngestWarning::PermissionDenied(message),
-            other => MentionIngestWarning::ApiFailure(other.to_string()),
-        }
-    }
-
-    async fn run_ingest_engagement(&self, run_id: &str, max_depth: u32) -> Result<u64> {
-        // Seed: every post in the store authored by the authenticated user.
-        let me = self.provider.fetch_me().await?;
-        self.store.upsert_user(&me)?;
-        if let Some(username) = &me.username {
-            self.store.resolve_author(username, &me.id)?;
-        }
-        let seeds = self.store.posts_by_author(&me.id)?;
-        info!(
-            seeds = seeds.len(),
-            author = %me.id,
-            max_depth,
-            "ingest_engagement: BFS descending fetch_replies from every post I authored"
-        );
-
-        let mut seen: HashSet<PostId> = HashSet::with_capacity(seeds.len() * 4);
-        for s in &seeds {
-            seen.insert(s.clone());
-        }
-
-        // BFS queue: (post_id, depth_from_seed).
-        let mut frontier: std::collections::VecDeque<(PostId, u32)> =
-            seeds.into_iter().map(|id| (id, 0)).collect();
-
-        let mut batch = Vec::with_capacity(BATCH_SIZE);
-        let mut total: u64 = 0;
-        while let Some((pid, depth)) = frontier.pop_front() {
-            if depth >= max_depth {
-                continue;
-            }
-            let mut cursor: Option<Cursor> = None;
-            loop {
-                let page = self.provider.fetch_replies(&pid, cursor).await?;
-                let has_next = page.next.is_some();
-                for reply in page.items {
-                    if !seen.insert(reply.id.clone()) {
-                        continue; // already seen — skip.
-                    }
-                    frontier.push_back((reply.id.clone(), depth + 1));
-                    batch.push(reply);
-                    if batch.len() >= BATCH_SIZE {
-                        total += self.store.upsert_posts(&batch, Some(run_id))? as u64;
-                        batch.clear();
-                    }
-                }
-                cursor = page.next;
-                if !has_next {
-                    break;
-                }
-            }
-        }
-        if !batch.is_empty() {
-            total += self.store.upsert_posts(&batch, Some(run_id))? as u64;
-        }
-        Ok(total)
-    }
-
-    async fn run_ingest_thread(&self, run_id: &str, root: &PostId) -> Result<u64> {
-        let mut seen: HashSet<PostId> = HashSet::new();
-        let mut batch = Vec::new();
-        let mut total: u64 = 0;
-
-        // Use the provider's `fetch_thread` which returns root + all
-        // descendants via the manifest's `post/conversation` edge. Previously
-        // this method only called `fetch_replies`, silently dropping the root
-        // when it wasn't already in the store and storing ZERO posts for a
-        // thread with no replies while still reporting success.
-        info!(root = %root, "fetching conversation");
-        let posts = self.provider.fetch_thread(root).await?;
-        for post in posts {
-            if seen.insert(post.id.clone()) {
-                batch.push(post);
-            }
-            if batch.len() >= BATCH_SIZE {
-                let written = self.store.upsert_posts(&batch, Some(run_id))?;
-                total += written as u64;
-                batch.clear();
-            }
-        }
-
-        // Flush remaining.
-        if !batch.is_empty() {
-            let written = self.store.upsert_posts(&batch, Some(run_id))?;
-            total += written as u64;
-        }
-
-        Ok(total)
     }
 }

@@ -7,9 +7,12 @@ use chrono::{DateTime, Utc};
 use serde_json::json;
 use threads_core::{
     AudienceInsightQuery, AudienceInsightResult, AudienceSnapshot, Cursor, DemographicBucket,
-    DemographicDimension, Error, FetchRun, Mention, Page, Post, PostId, Result, User, UserId,
+    DemographicDimension, DemographicInsight, Error, FetchRun, Mention, Page, Post, PostId, Result,
+    User, UserId,
 };
-use threads_ingest::{Ingestor, NormalizeError, Normalizer, OfficialNormalizer, StoreWrite};
+use threads_ingest::{
+    Ingestor, MentionIngestWarning, NormalizeError, Normalizer, OfficialNormalizer, StoreWrite,
+};
 
 // ---------- Fixtures (loaded from files) ----------
 
@@ -212,7 +215,11 @@ struct MockAudience {
 
 #[derive(Clone, Copy)]
 enum MockProviderError {
+    Auth,
     PermissionDenied,
+    Network,
+    RateLimit,
+    Parse,
 }
 
 impl MockProvider {
@@ -326,7 +333,7 @@ impl threads_core::Provider for MockProvider {
 
     async fn fetch_audience_insight(
         &self,
-        user_id: &UserId,
+        _user_id: &UserId,
         query: AudienceInsightQuery,
     ) -> Result<AudienceInsightResult> {
         self.audience_queries.lock().unwrap().push(query.clone());
@@ -342,11 +349,9 @@ impl threads_core::Provider for MockProvider {
                 if audience.fail_dimension == Some(dimension) {
                     return Err(Error::Parse(format!("{dimension:?} unavailable")));
                 }
-                Ok(AudienceInsightResult::Demographics(AudienceSnapshot {
-                    account_id: user_id.clone(),
-                    observed_at: Utc::now(),
-                    followers_count: audience.followers_count,
-                    demographics: audience
+                Ok(AudienceInsightResult::Demographics(DemographicInsight {
+                    dimension,
+                    buckets: audience
                         .demographics
                         .iter()
                         .filter(|bucket| bucket.dimension == dimension)
@@ -366,9 +371,13 @@ impl threads_core::Provider for MockProvider {
         self.mention_requests.lock().unwrap().push(cursor);
         if let Some(error) = self.mention_error {
             return match error {
+                MockProviderError::Auth => Err(Error::Auth("expired token".into())),
                 MockProviderError::PermissionDenied => {
                     Err(Error::PermissionDenied("threads_manage_mentions".into()))
                 }
+                MockProviderError::Network => Err(Error::Network("connection reset".into())),
+                MockProviderError::RateLimit => Err(Error::RateLimit { retry_after: None }),
+                MockProviderError::Parse => Err(Error::Parse("malformed response".into())),
             };
         }
         Ok(self.mention_page.clone().unwrap_or_else(Page::empty))
@@ -388,18 +397,30 @@ struct MockStoreState {
 
 struct MockStore {
     state: Mutex<MockStoreState>,
+    fail_post_upsert: bool,
 }
 
 impl MockStore {
     fn new() -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new(MockStoreState::default()),
+            fail_post_upsert: false,
+        })
+    }
+
+    fn failing_post_upserts() -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(MockStoreState::default()),
+            fail_post_upsert: true,
         })
     }
 }
 
 impl StoreWrite for MockStore {
     fn upsert_posts(&self, posts: &[Post], _fetch_run_id: Option<&str>) -> Result<usize> {
+        if self.fail_post_upsert {
+            return Err(Error::Store("simulated post upsert failure".into()));
+        }
         let mut s = self.state.lock().unwrap();
         s.upserted.extend_from_slice(posts);
         Ok(posts.len())
@@ -1142,6 +1163,117 @@ async fn refresh_audience_retains_snapshot_when_mentions_are_permission_denied()
         .expect("mention permission denial must become a warning");
 
     // Then: the snapshot remains durable and the warning is typed in the summary.
-    assert!(summary.mention_warning.is_some());
+    assert!(matches!(
+        summary.mention_warning,
+        Some(MentionIngestWarning::PermissionDenied(ref scope)) if scope == "threads_manage_mentions"
+    ));
+    assert_eq!(store.state.lock().unwrap().audience_snapshots.len(), 1);
+}
+
+#[tokio::test]
+async fn refresh_audience_hard_fails_when_mentions_authentication_expires() {
+    // Given: insights succeed, but the mentions endpoint rejects an expired token.
+    let provider = Arc::new(
+        MockProvider::new(vec![])
+            .with_me(audience_account())
+            .with_audience(audience_with_all_breakdowns(99))
+            .with_mention_error(MockProviderError::Auth),
+    );
+    let store = MockStore::new();
+    let ingestor = Ingestor::new(provider, Box::new(NoopNormalizer), Arc::clone(&store));
+
+    // When: refresh reaches the mentions phase.
+    let result = ingestor.refresh_audience().await;
+
+    // Then: authentication failure is returned, while the completed snapshot remains durable.
+    assert!(matches!(result, Err(Error::Auth(ref message)) if message == "expired token"));
+    assert_eq!(store.state.lock().unwrap().audience_snapshots.len(), 1);
+}
+
+#[tokio::test]
+async fn refresh_audience_hard_fails_when_mentions_network_fails() {
+    // Given: insights succeed, but fetching mentions loses its network connection.
+    let provider = Arc::new(
+        MockProvider::new(vec![])
+            .with_me(audience_account())
+            .with_audience(audience_with_all_breakdowns(99))
+            .with_mention_error(MockProviderError::Network),
+    );
+    let store = MockStore::new();
+    let ingestor = Ingestor::new(provider, Box::new(NoopNormalizer), Arc::clone(&store));
+
+    // When: refresh reaches the mentions phase.
+    let result = ingestor.refresh_audience().await;
+
+    // Then: the exact network error is returned and the snapshot remains durable.
+    assert!(matches!(result, Err(Error::Network(ref message)) if message == "connection reset"));
+    assert_eq!(store.state.lock().unwrap().audience_snapshots.len(), 1);
+}
+
+#[tokio::test]
+async fn refresh_audience_hard_fails_when_mentions_response_is_malformed() {
+    // Given: insights succeed, but mention parsing fails.
+    let provider = Arc::new(
+        MockProvider::new(vec![])
+            .with_me(audience_account())
+            .with_audience(audience_with_all_breakdowns(99))
+            .with_mention_error(MockProviderError::Parse),
+    );
+    let store = MockStore::new();
+    let ingestor = Ingestor::new(provider, Box::new(NoopNormalizer), Arc::clone(&store));
+
+    // When: refresh reaches the mentions phase.
+    let result = ingestor.refresh_audience().await;
+
+    // Then: the exact parse error is returned and the snapshot remains durable.
+    assert!(matches!(result, Err(Error::Parse(ref message)) if message == "malformed response"));
+    assert_eq!(store.state.lock().unwrap().audience_snapshots.len(), 1);
+}
+
+#[tokio::test]
+async fn refresh_audience_hard_fails_when_mentions_are_rate_limited() {
+    // Given: insights succeed, but the mentions endpoint returns a rate limit.
+    let provider = Arc::new(
+        MockProvider::new(vec![])
+            .with_me(audience_account())
+            .with_audience(audience_with_all_breakdowns(99))
+            .with_mention_error(MockProviderError::RateLimit),
+    );
+    let store = MockStore::new();
+    let ingestor = Ingestor::new(provider, Box::new(NoopNormalizer), Arc::clone(&store));
+
+    // When: refresh reaches the mentions phase.
+    let result = ingestor.refresh_audience().await;
+
+    // Then: the exact rate-limit error is returned and the snapshot remains durable.
+    assert!(matches!(
+        result,
+        Err(Error::RateLimit { retry_after: None })
+    ));
+    assert_eq!(store.state.lock().unwrap().audience_snapshots.len(), 1);
+}
+
+#[tokio::test]
+async fn refresh_audience_hard_fails_when_mention_persistence_fails() {
+    // Given: insights and the mention response succeed, but post persistence fails.
+    let provider = Arc::new(
+        MockProvider::new(vec![])
+            .with_me(audience_account())
+            .with_audience(audience_with_all_breakdowns(99))
+            .with_mentions(Page::new(
+                vec![MockProvider::make_post("mentioned-post", "another-user")],
+                None,
+            )),
+    );
+    let store = MockStore::failing_post_upserts();
+    let ingestor = Ingestor::new(provider, Box::new(NoopNormalizer), Arc::clone(&store));
+
+    // When: mention ingestion attempts to persist the fetched post.
+    let result = ingestor.refresh_audience().await;
+
+    // Then: the exact store error is returned and the snapshot remains durable.
+    assert!(
+        matches!(result, Err(Error::Store(ref message)) if message == "simulated post upsert failure")
+    );
     assert_eq!(store.state.lock().unwrap().audience_snapshots.len(), 1);
 }
