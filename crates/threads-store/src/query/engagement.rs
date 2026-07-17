@@ -22,13 +22,17 @@ pub fn rank_engaged_accounts(
                  SELECT reply.author_id, COUNT(DISTINCT reply.id) AS replies
                  FROM posts AS reply
                  JOIN posts AS parent ON parent.id = reply.parent_id
-                 WHERE parent.author_id = ?1 AND reply.author_id <> ?1
+                 WHERE parent.author_id = ?1
+                   AND reply.author_id <> ?1
+                   AND reply.is_quote_post = 0
                  GROUP BY reply.author_id
              ), mention_counts AS (
                  SELECT post.author_id, COUNT(DISTINCT mention.post_id) AS mentions
                  FROM mentions AS mention
                  JOIN posts AS post ON post.id = mention.post_id
-                 WHERE mention.user_id = ?1 AND post.author_id <> ?1
+                 WHERE mention.user_id = ?1
+                   AND post.author_id <> ?1
+                   AND post.is_quote_post = 0
                  GROUP BY post.author_id
              ), engaged_ids AS (
                  SELECT author_id FROM reply_counts

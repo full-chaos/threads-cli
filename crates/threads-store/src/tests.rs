@@ -1558,6 +1558,37 @@ mod tests {
     }
 
     #[test]
+    fn rank_engaged_accounts_excludes_quote_activity_from_every_sort_and_limit() {
+        // Given a quote of the target's post that would otherwise be both a
+        // direct reply and an official mention from an absent author.
+        let store = Store::open_in_memory().unwrap();
+        let target = UserId::new("target");
+        let target_post = relationship_post("target-post", "target");
+        store.upsert_post(&target_post, None).unwrap();
+        let mut quote = relationship_post("quote-post", "quote-author");
+        quote.parent_id = Some(PostId::new("target-post"));
+        quote.mentions = vec![Mention {
+            username: "target".into(),
+            user_id: Some(target.clone()),
+        }];
+        quote.is_quote_post = true;
+        store.upsert_post(&quote, None).unwrap();
+
+        // When rankings are requested with every primary sort and a restrictive limit.
+        let rankings = [
+            EngagementSort::Total,
+            EngagementSort::Replies,
+            EngagementSort::Mentions,
+        ]
+        .into_iter()
+        .map(|sort| store.rank_engaged_accounts(&target, 1, sort).unwrap())
+        .collect::<Vec<_>>();
+
+        // Then quote activity cannot create an engaged account in any ranking.
+        assert!(rankings.iter().all(Vec::is_empty));
+    }
+
+    #[test]
     fn rank_engaged_accounts_returns_empty_for_unobserved_account() {
         // Given an account with no observed replies or targeted mentions.
         let store = Store::open_in_memory().unwrap();
