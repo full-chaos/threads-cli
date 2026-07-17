@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use chrono::Utc;
 use threads_core::{
     AudienceInsightQuery, AudienceInsightResult, AudienceSnapshot, DemographicBucket,
-    DemographicDimension, Error, Mention, Result, User, UserId,
+    DemographicDimension, Error, Mention, PermissionRequirement, Result, User, UserId,
 };
 
 use super::{AudienceRefreshSummary, Ingestor, MentionIngestWarning};
@@ -26,7 +26,9 @@ impl<P: threads_core::Provider + 'static, S: StoreWrite + 'static> Ingestor<P, S
         &self,
         expected_account_id: Option<&UserId>,
     ) -> Result<AudienceRefreshSummary> {
-        let account = self.provider.fetch_me().await?;
+        let account = self.provider.fetch_me().await.map_err(|error| {
+            permission_requirement(error, PermissionRequirement::AuthenticatedAccount)
+        })?;
         if let Some(expected_account_id) = expected_account_id {
             if account.id != *expected_account_id {
                 return Err(Error::Auth(format!(
@@ -66,8 +68,10 @@ impl<P: threads_core::Provider + 'static, S: StoreWrite + 'static> Ingestor<P, S
         match self
             .provider
             .fetch_audience_insight(account_id, AudienceInsightQuery::FollowersCount)
-            .await?
-        {
+            .await
+            .map_err(|error| {
+                permission_requirement(error, PermissionRequirement::AudienceInsights)
+            })? {
             AudienceInsightResult::FollowersCount(value) => Ok(value),
             AudienceInsightResult::Demographics(_) => Err(Error::Parse(
                 "followers_count request returned demographics".into(),
@@ -92,8 +96,10 @@ impl<P: threads_core::Provider + 'static, S: StoreWrite + 'static> Ingestor<P, S
                     account_id,
                     AudienceInsightQuery::FollowerDemographics(dimension),
                 )
-                .await?
-            {
+                .await
+                .map_err(|error| {
+                    permission_requirement(error, PermissionRequirement::AudienceInsights)
+                })? {
                 AudienceInsightResult::Demographics(insight) => {
                     if insight.dimension != dimension {
                         return Err(Error::Parse(format!(
@@ -134,10 +140,12 @@ impl<P: threads_core::Provider + 'static, S: StoreWrite + 'static> Ingestor<P, S
                 .await
             {
                 Ok(page) => page,
-                Err(Error::PermissionDenied(scope)) => {
+                Err(Error::PermissionDenied(_)) => {
                     return Ok((
                         mentions_ingested,
-                        Some(MentionIngestWarning::PermissionDenied(scope)),
+                        Some(MentionIngestWarning::PermissionDenied(
+                            PermissionRequirement::Mentions.scope().into(),
+                        )),
                     ));
                 }
                 Err(error) => return Err(error),
@@ -166,3 +174,17 @@ impl<P: threads_core::Provider + 'static, S: StoreWrite + 'static> Ingestor<P, S
         }
     }
 }
+
+fn permission_requirement(error: Error, requirement: PermissionRequirement) -> Error {
+    match error {
+        Error::PermissionDenied(detail) => Error::MissingPermission {
+            requirement,
+            detail,
+        },
+        other => other,
+    }
+}
+
+#[cfg(test)]
+#[path = "audience_refresh_tests.rs"]
+mod tests;

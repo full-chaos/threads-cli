@@ -75,6 +75,11 @@ fn mention_warning_message(summary: &threads_ingest::AudienceRefreshSummary) -> 
 
 fn audience_refresh_error(error: threads_core::Error) -> anyhow::Error {
     match error {
+        threads_core::Error::MissingPermission { requirement, .. } => anyhow!(
+            "{} permission denied; `{}` was not granted. Run `threads-cli auth login` to request it again.",
+            requirement.stage(),
+            requirement.scope(),
+        ),
         threads_core::Error::PermissionDenied(_) => anyhow!(
             "audience insights permission denied; `threads_manage_insights` was not granted. Run `threads-cli auth login` to request it again."
         ),
@@ -251,3 +256,7 @@ fn validated_before(value: &str) -> Result<DateTime<Utc>> {
 #[cfg(test)]
 #[path = "audience_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "audience_permissions_tests.rs"]
+mod audience_permissions_tests;

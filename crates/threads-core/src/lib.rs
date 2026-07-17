@@ -14,7 +14,7 @@ pub mod model;
 pub mod provider;
 pub mod publish;
 
-pub use error::{Error, Result};
+pub use error::{Error, PermissionRequirement, Result};
 pub use model::{
     AudienceInsightQuery, AudienceInsightResult, AudienceSnapshot, Cursor, DemographicBucket,
     DemographicDimension, DemographicInsight, Edge, EdgeKind, EngagedAccount, EngagementSort,

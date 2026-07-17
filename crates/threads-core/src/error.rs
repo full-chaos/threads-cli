@@ -1,8 +1,39 @@
-use std::time::Duration;
+use std::{fmt, time::Duration};
 
 use thiserror::Error;
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PermissionRequirement {
+    AuthenticatedAccount,
+    AudienceInsights,
+    Mentions,
+}
+
+impl PermissionRequirement {
+    pub const fn scope(self) -> &'static str {
+        match self {
+            Self::AuthenticatedAccount => "threads_basic",
+            Self::AudienceInsights => "threads_manage_insights",
+            Self::Mentions => "threads_manage_mentions",
+        }
+    }
+
+    pub const fn stage(self) -> &'static str {
+        match self {
+            Self::AuthenticatedAccount => "authenticated account lookup",
+            Self::AudienceInsights => "audience insights",
+            Self::Mentions => "mentions",
+        }
+    }
+}
+
+impl fmt::Display for PermissionRequirement {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{} ({})", self.stage(), self.scope())
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -11,6 +42,12 @@ pub enum Error {
 
     #[error("permission denied: {0}")]
     PermissionDenied(String),
+
+    #[error("permission denied for {requirement}: {detail}")]
+    MissingPermission {
+        requirement: PermissionRequirement,
+        detail: String,
+    },
 
     #[error("network error: {0}")]
     Network(String),
@@ -74,6 +111,14 @@ mod tests {
         assert_eq!(
             Error::PermissionDenied("missing scope".into()).to_string(),
             "permission denied: missing scope"
+        );
+        assert_eq!(
+            Error::MissingPermission {
+                requirement: PermissionRequirement::AuthenticatedAccount,
+                detail: "403".into(),
+            }
+            .to_string(),
+            "permission denied for authenticated account lookup (threads_basic): 403"
         );
         assert_eq!(
             Error::RateLimit {
